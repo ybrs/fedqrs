@@ -80,42 +80,27 @@ pub fn fetch(name: &str, sql: &str) -> PyResult<(SchemaRef, Vec<RecordBatch>)> {
     }
 }
 
-thread_local! {
-    // One DuckDB connection per database path (keyed by path, not datasource
-    // name, so a name reused across tests with different files opens the right
-    // database). DuckDB handles are not Send, so this stays thread-local.
-    static DUCK_CACHE: RefCell<HashMap<String, duckdb::Connection>> = RefCell::new(HashMap::new());
-}
-
 fn open_duckdb(path: &str) -> Result<duckdb::Connection, String> {
-    if path == ":memory:" {
-        duckdb::Connection::open_in_memory().map_err(|e| format!("duckdb open: {e}"))
-    } else {
-        duckdb::Connection::open(path).map_err(|e| format!("duckdb open '{path}': {e}"))
-    }
+    duckdb::Connection::open(path).map_err(|e| format!("duckdb open '{path}': {e}"))
 }
 
 fn fetch_duckdb(s: &DsSpec, sql: &str) -> PyResult<(SchemaRef, Vec<RecordBatch>)> {
-    DUCK_CACHE.with(|cache| {
-        let mut map = cache.borrow_mut();
-        if !map.contains_key(&s.uri) {
-            let conn = open_duckdb(&s.uri).map_err(PyRuntimeError::new_err)?;
-            map.insert(s.uri.clone(), conn);
-        }
-        let conn = map.get(&s.uri).unwrap();
-        let mut stmt = conn
-            .prepare(sql)
-            .map_err(|e| PyRuntimeError::new_err(format!("duckdb prepare: {e}")))?;
-        let arrow = stmt
-            .query_arrow([])
-            .map_err(|e| PyRuntimeError::new_err(format!("duckdb query: {e}")))?;
-        let schema = arrow.get_schema();
-        let mut batches = Vec::new();
-        for batch in arrow {
-            batches.push(batch);
-        }
-        Ok((schema, batches))
-    })
+    // Open the database file fresh for each fetch. A cached connection snapshots
+    // the catalog at open time, so it would miss tables created later in the
+    // same session; a DuckDB source is a real file, so re-opening is cheap.
+    let conn = open_duckdb(&s.uri).map_err(PyRuntimeError::new_err)?;
+    let mut stmt = conn
+        .prepare(sql)
+        .map_err(|e| PyRuntimeError::new_err(format!("duckdb prepare: {e}")))?;
+    let arrow = stmt
+        .query_arrow([])
+        .map_err(|e| PyRuntimeError::new_err(format!("duckdb query: {e}")))?;
+    let schema = arrow.get_schema();
+    let mut batches = Vec::new();
+    for batch in arrow {
+        batches.push(batch);
+    }
+    Ok((schema, batches))
 }
 
 // Returns a String error (not PyErr) so it can also run on a worker thread that
