@@ -12,7 +12,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use arrow::array::{ArrayRef, RecordBatch, RecordBatchReader};
+use arrow::array::{ArrayRef, Int64Array, RecordBatch, RecordBatchReader};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -85,26 +85,29 @@ pub fn fetch(name: &str, sql: &str) -> PyResult<(SchemaRef, Vec<RecordBatch>)> {
     }
 }
 
-fn open_pg(s: &DsSpec) -> PyResult<PgConn> {
+// Returns a String error (not PyErr) so it can also run on a worker thread that
+// does not hold the GIL (the parallel-scan path spawns such threads).
+fn open_pg(s: &DsSpec) -> Result<PgConn, String> {
     use adbc_core::options::{AdbcVersion, OptionDatabase, OptionValue};
     use adbc_core::{Database, Driver};
 
-    let driver_path = s.adbc_driver.as_deref().ok_or_else(|| {
-        PyValueError::new_err("postgres datasource requires an 'adbc_driver' path")
-    })?;
+    let driver_path = s
+        .adbc_driver
+        .as_deref()
+        .ok_or_else(|| "postgres datasource requires an 'adbc_driver' path".to_string())?;
     let mut driver = adbc_driver_manager::ManagedDriver::load_dynamic_from_filename(
         driver_path,
         None,
         AdbcVersion::V100,
     )
-    .map_err(|e| PyRuntimeError::new_err(format!("load adbc driver: {e}")))?;
+    .map_err(|e| format!("load adbc driver: {e}"))?;
     let opts = [(OptionDatabase::Uri, OptionValue::String(s.uri.clone()))];
     let mut database = driver
         .new_database_with_opts(opts)
-        .map_err(|e| PyRuntimeError::new_err(format!("adbc database: {e}")))?;
+        .map_err(|e| format!("adbc database: {e}"))?;
     let conn = database
         .new_connection()
-        .map_err(|e| PyRuntimeError::new_err(format!("adbc connection: {e}")))?;
+        .map_err(|e| format!("adbc connection: {e}"))?;
     Ok(PgConn { _driver: driver, _database: database, conn })
 }
 
@@ -118,7 +121,7 @@ fn fetch_postgres(
     PG_CACHE.with(|cache| {
         let mut map = cache.borrow_mut();
         if !map.contains_key(name) {
-            let conn = open_pg(s)?;
+            let conn = open_pg(s).map_err(PyRuntimeError::new_err)?;
             map.insert(name.to_string(), conn);
         }
         let pg = map.get_mut(name).unwrap();
@@ -197,6 +200,134 @@ fn normalize_numeric(
         out.push(RecordBatch::try_new(new_schema.clone(), cols)?);
     }
     Ok((new_schema, out))
+}
+
+// --- parallel partitioned scan -----------------------------------------------
+//
+// A large whole-table read over one Postgres connection is bandwidth-bound. We
+// match DuckDB's postgres scanner: split the table's heap into `ctid` page
+// ranges and read them concurrently over N connections (each a binary COPY),
+// then concatenate the Arrow. `ctid` is a row's physical (page, tuple) address,
+// so page ranges partition the table with no partition column and no overlap.
+
+/// Escape a single-quoted SQL string literal.
+fn esc(s: &str) -> String {
+    s.replace('\'', "''")
+}
+
+/// Quote a (schema.)table reference.
+fn qualified_table(schema: Option<&str>, table: &str) -> String {
+    let t = table.replace('"', "\"\"");
+    match schema {
+        Some(s) => format!("\"{}\".\"{}\"", s.replace('"', "\"\""), t),
+        None => format!("\"{t}\""),
+    }
+}
+
+/// The table's heap page count (`pg_class.relpages`), for sizing the ranges.
+fn relpages(name: &str, schema: Option<&str>, table: &str) -> PyResult<u32> {
+    let pred = match schema {
+        Some(s) => format!("c.relname = '{}' AND n.nspname = '{}'", esc(table), esc(s)),
+        None => format!("c.relname = '{}'", esc(table)),
+    };
+    let sql = format!(
+        "SELECT c.relpages::bigint FROM pg_class c \
+         JOIN pg_namespace n ON n.oid = c.relnamespace WHERE {pred}"
+    );
+    let (_, batches) = fetch(name, &sql)?;
+    for batch in &batches {
+        if batch.num_rows() > 0 {
+            let col = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .ok_or_else(|| PyRuntimeError::new_err("relpages is not int8"))?;
+            return Ok(col.value(0).max(0) as u32);
+        }
+    }
+    Err(PyRuntimeError::new_err(format!(
+        "table '{table}' not found for relpages"
+    )))
+}
+
+/// Split [0, pages) into `partitions` half-open page ranges; the last extends to
+/// the max page so rows added since the last ANALYZE are still covered.
+fn ctid_ranges(pages: u32, partitions: usize) -> Vec<(u32, u32)> {
+    if pages == 0 {
+        return vec![(0, u32::MAX)];
+    }
+    let partitions = (partitions.max(1) as u32).min(pages);
+    let chunk = (pages / partitions).max(1);
+    let mut ranges = Vec::new();
+    let mut lo = 0u32;
+    while lo < pages {
+        let hi = lo.saturating_add(chunk);
+        ranges.push((lo, hi));
+        lo = hi;
+    }
+    if let Some(last) = ranges.last_mut() {
+        last.1 = u32::MAX;
+    }
+    ranges
+}
+
+/// Read one page range on its own connection (runs on a worker thread).
+fn read_partition(spec: &DsSpec, sql: &str) -> Result<(SchemaRef, Vec<RecordBatch>), String> {
+    use adbc_core::{Connection, Statement};
+
+    // conn and stmt must outlive the reader (dropping the statement invalidates
+    // the ADBC C stream), so they stay in scope through the read below.
+    let mut conn = open_pg(spec)?;
+    let mut stmt = conn.conn.new_statement().map_err(|e| format!("adbc statement: {e}"))?;
+    stmt.set_sql_query(sql).map_err(|e| format!("adbc set sql: {e}"))?;
+    let reader = stmt.execute().map_err(|e| format!("adbc execute: {e}"))?;
+    let schema = reader.schema();
+    let mut batches = Vec::new();
+    for batch in reader {
+        batches.push(batch.map_err(|e| format!("adbc batch: {e}"))?);
+    }
+    normalize_numeric(schema, batches).map_err(|e| format!("numeric normalize: {e}"))
+}
+
+/// Read `select_list` from a Postgres table with `partitions`-way parallel
+/// ctid-partitioned binary COPY reads, concatenated into one Arrow result.
+pub fn fetch_parallel(
+    name: &str,
+    schema: Option<&str>,
+    table: &str,
+    select_list: &str,
+    partitions: usize,
+) -> PyResult<(SchemaRef, Vec<RecordBatch>)> {
+    let s = spec(name)?;
+    if s.kind != DsKind::Postgres {
+        return Err(PyRuntimeError::new_err("parallel fetch is Postgres-only"));
+    }
+    let pages = relpages(name, schema, table)?;
+    let table_ref = qualified_table(schema, table);
+
+    let mut handles = Vec::new();
+    for (lo, hi) in ctid_ranges(pages, partitions) {
+        let worker_spec = s.clone();
+        let sql = format!(
+            "SELECT {select_list} FROM {table_ref} \
+             WHERE ctid >= '({lo},0)'::tid AND ctid < '({hi},0)'::tid"
+        );
+        handles.push(std::thread::spawn(move || read_partition(&worker_spec, &sql)));
+    }
+
+    let mut result_schema: Option<SchemaRef> = None;
+    let mut all = Vec::new();
+    for handle in handles {
+        let joined = handle
+            .join()
+            .map_err(|_| PyRuntimeError::new_err("partition thread panicked"))?;
+        let (schema, batches) = joined.map_err(PyRuntimeError::new_err)?;
+        result_schema.get_or_insert(schema);
+        all.extend(batches);
+    }
+    let result_schema = result_schema
+        .ok_or_else(|| PyRuntimeError::new_err("parallel fetch produced no partitions"))?;
+    Ok((result_schema, all))
 }
 
 /// Parse the `register_datasource` params dict into a spec.

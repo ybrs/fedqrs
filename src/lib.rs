@@ -38,6 +38,22 @@ fn fetch_to_stream(name: &str, sql: &str) -> PyResult<ArrowStreamExport> {
     Ok(stream_from_batches(schema, batches))
 }
 
+/// Parallel ctid-partitioned scan of a Postgres table, returned as one Arrow
+/// stream. Exposed for benchmarking the parallel read against DuckDB.
+#[pyfunction]
+#[pyo3(signature = (name, table, select_list, partitions, schema=None))]
+fn fetch_parallel_to_stream(
+    name: &str,
+    table: &str,
+    select_list: &str,
+    partitions: usize,
+    schema: Option<String>,
+) -> PyResult<ArrowStreamExport> {
+    let (result_schema, batches) =
+        connectors::fetch_parallel(name, schema.as_deref(), table, select_list, partitions)?;
+    Ok(stream_from_batches(result_schema, batches))
+}
+
 /// Execute a query IR and return the result as an exportable Arrow stream.
 /// Everything runs in Rust; the result is the only thing that crosses back.
 #[pyfunction]
@@ -68,6 +84,7 @@ fn fedqrs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(execute_ir, m)?)?;
     m.add_function(wrap_pyfunction!(register_datasource, m)?)?;
     m.add_function(wrap_pyfunction!(fetch_to_stream, m)?)?;
+    m.add_function(wrap_pyfunction!(fetch_parallel_to_stream, m)?)?;
     m.add_class::<ArrowStreamExport>()?;
     Ok(())
 }
