@@ -91,11 +91,20 @@ parse/bind/optimize/plan
   Proven: the REAL planner's cross-source join and single-source query both
   match the DuckDB path. Making Rust the DEFAULT Executor path is gated on
   operator parity (Phase 5).
-- Phase 5+ - NEXT. Operator parity (outer/semi/anti joins, aggregate, sort,
-  union/set-ops, window, cross-source lateral, multi-key joins); full
-  single-source-subtree SQL already covered via raw_sql; ClickHouse + native
-  DuckDB connectors; then make Rust the default Executor path and remove the
-  DuckDB merge engine (approval-gated).
+- Phase 5 - IN PROGRESS.
+  - DONE: recursive serializer foundation (_emit(node)->binding; a binding's
+    columns are named by the node's output schema; parents resolve via
+    child.column_aliases()). Join emits canonical output columns; projection is
+    its own fragment.
+  - DONE: aggregate fragment (cross-source GROUP BY, built as DataFusion SQL so
+    every agg function works; count(*) handled).
+  - DONE: sort fragment (ORDER BY with direction + NULL placement).
+  - All parity-tested vs the DuckDB path in tests/test_rust_engine.py (6 tests).
+  - Adding an operator is now a fixed 4-step template: ir.rs Fragment variant ->
+    engine.rs run_* -> rust_ir.py _emit_* -> a parity test.
+  - TODO: union/set-ops, outer/semi/anti joins, multi-key joins, window,
+    cross-source lateral; native DuckDB + ClickHouse connectors; then make Rust
+    the default Executor path and remove the DuckDB merge engine (approval-gated).
 
 ### Original phase notes
 
