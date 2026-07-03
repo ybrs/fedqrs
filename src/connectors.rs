@@ -280,22 +280,50 @@ fn ctid_ranges(pages: u32, partitions: usize) -> Vec<(u32, u32)> {
     ranges
 }
 
-/// Read one page range on its own connection (runs on a worker thread).
-fn read_partition(spec: &DsSpec, sql: &str) -> Result<(SchemaRef, Vec<RecordBatch>), String> {
-    use adbc_core::{Connection, Statement};
+const PARALLEL_WORKERS: usize = 8;
 
-    // conn and stmt must outlive the reader (dropping the statement invalidates
-    // the ADBC C stream), so they stay in scope through the read below.
-    let mut conn = open_pg(spec)?;
-    let mut stmt = conn.conn.new_statement().map_err(|e| format!("adbc statement: {e}"))?;
-    stmt.set_sql_query(sql).map_err(|e| format!("adbc set sql: {e}"))?;
-    let reader = stmt.execute().map_err(|e| format!("adbc execute: {e}"))?;
-    let schema = reader.schema();
-    let mut batches = Vec::new();
-    for batch in reader {
-        batches.push(batch.map_err(|e| format!("adbc batch: {e}"))?);
+type QueryResult = Result<(SchemaRef, Vec<RecordBatch>), String>;
+
+/// A partition read for a worker to run. The connection stays on the worker
+/// (ADBC handles are not Send); only the job and its Arrow result cross channels.
+struct Job {
+    name: String,
+    spec: DsSpec,
+    sql: String,
+    reply: std::sync::mpsc::Sender<QueryResult>,
+}
+
+/// A fixed pool of long-lived reader threads, each keeping its own connections.
+/// Persisting the threads pools connections across parallel scans, so repeated
+/// reads pay no reconnect cost (the reason a spawn-per-call design was slower).
+fn parallel_pool() -> &'static Vec<std::sync::mpsc::Sender<Job>> {
+    static POOL: OnceLock<Vec<std::sync::mpsc::Sender<Job>>> = OnceLock::new();
+    POOL.get_or_init(|| {
+        let mut senders = Vec::new();
+        for _ in 0..PARALLEL_WORKERS {
+            let (tx, rx) = std::sync::mpsc::channel::<Job>();
+            std::thread::spawn(move || worker_loop(rx));
+            senders.push(tx);
+        }
+        senders
+    })
+}
+
+/// One reader thread: keep a per-datasource connection and serve jobs until the
+/// pool is dropped (process exit).
+fn worker_loop(rx: std::sync::mpsc::Receiver<Job>) {
+    let mut conns: HashMap<String, PgConn> = HashMap::new();
+    while let Ok(job) = rx.recv() {
+        let _ = job.reply.send(run_job(&mut conns, &job));
     }
-    normalize_numeric(schema, batches).map_err(|e| format!("numeric normalize: {e}"))
+}
+
+fn run_job(conns: &mut HashMap<String, PgConn>, job: &Job) -> QueryResult {
+    if !conns.contains_key(&job.name) {
+        conns.insert(job.name.clone(), open_pg(&job.spec)?);
+    }
+    let pg = conns.get_mut(&job.name).unwrap();
+    run_query(&mut pg.conn, &job.sql)
 }
 
 /// Read `select_list` from a Postgres table with `partitions`-way parallel
@@ -319,22 +347,27 @@ pub fn fetch_parallel(
         None => String::new(),
     };
 
-    let mut handles = Vec::new();
-    for (lo, hi) in ctid_ranges(pages, partitions) {
-        let worker_spec = s.clone();
+    let pool = parallel_pool();
+    let mut replies = Vec::new();
+    for (i, (lo, hi)) in ctid_ranges(pages, partitions).into_iter().enumerate() {
         let sql = format!(
             "SELECT {select_list} FROM {table_ref} \
              WHERE ctid >= '({lo},0)'::tid AND ctid < '({hi},0)'::tid{extra}"
         );
-        handles.push(std::thread::spawn(move || read_partition(&worker_spec, &sql)));
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        let job = Job { name: name.to_string(), spec: s.clone(), sql, reply: reply_tx };
+        pool[i % pool.len()]
+            .send(job)
+            .map_err(|_| PyRuntimeError::new_err("parallel worker gone"))?;
+        replies.push(reply_rx);
     }
 
     let mut result_schema: Option<SchemaRef> = None;
     let mut all = Vec::new();
-    for handle in handles {
-        let joined = handle
-            .join()
-            .map_err(|_| PyRuntimeError::new_err("partition thread panicked"))?;
+    for reply_rx in replies {
+        let joined = reply_rx
+            .recv()
+            .map_err(|_| PyRuntimeError::new_err("parallel worker dropped its reply"))?;
         let (schema, batches) = joined.map_err(PyRuntimeError::new_err)?;
         result_schema.get_or_insert(schema);
         all.extend(batches);
@@ -425,8 +458,10 @@ pub fn estimate_selectivity(
         Some(s) => format!("c.relname='{}' AND n.nspname='{}'", esc(table), esc(s)),
         None => format!("c.relname='{}'", esc(table)),
     };
+    // n_distinct is `real` (float4) in pg_stats; cast both to float8 so the Arrow
+    // result is Float64 (a float4 would silently fail the Float64 downcast).
     let sql = format!(
-        "SELECT c.reltuples::float8, s.n_distinct FROM pg_class c \
+        "SELECT c.reltuples::float8, s.n_distinct::float8 FROM pg_class c \
          JOIN pg_namespace n ON n.oid=c.relnamespace \
          LEFT JOIN pg_stats s ON s.schemaname=n.nspname AND s.tablename=c.relname \
          AND s.attname='{}' WHERE {pred}",
