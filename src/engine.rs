@@ -25,7 +25,16 @@ use crate::connectors;
 use crate::expr::{literal_from_array, to_df_expr};
 use crate::ffi::{stream_from_batches, ArrowStreamExport};
 use crate::ir::{AggCall, AggSelectItem, Fragment, Ir, JoinKind, Projection, ScanSpec, Step};
-use crate::sql::{render_expr, scan_sql};
+use crate::sql::{base_filter_sql, render_expr, scan_sql, select_list_sql, temp_join_sql};
+
+/// Dynamic-filter strategy thresholds. Under `IN_CAP` distinct keys we inline an
+/// IN list; above it we push a temp table unless the filter would select more
+/// than `FULL_SCAN_FRACTION` of the probe, in which case a parallel full scan of
+/// the (bandwidth-bound) table wins. Partition count is tuned near the core count.
+const IN_CAP: usize = 2000;
+const FULL_SCAN_FRACTION: f64 = 0.40;
+const PARALLEL_PARTITIONS: usize = 8;
+const DYN_KEYS_TEMP_TABLE: &str = "fedq_dyn_keys";
 
 /// Fully-read Arrow data with its schema.
 struct Batches {
@@ -37,8 +46,8 @@ struct Batches {
 enum Binding {
     /// A relation held in memory (source result or fragment output).
     Materialized(Batches),
-    /// Distinct build-side keys, or None when the count exceeded the cap.
-    Keys(Option<Batches>),
+    /// The build side's distinct, NULL-free join-key values.
+    Keys(Batches),
 }
 
 fn df_to_py(e: DataFusionError) -> PyErr {
@@ -58,17 +67,17 @@ pub fn execute(ir: &Ir) -> PyResult<ArrowStreamExport> {
                 bindings.insert(binding.clone(), Binding::Materialized(batches));
             }
 
-            Step::CollectDistinct { input, key, cap, binding } => {
+            Step::CollectDistinct { input, key, cap: _, binding } => {
                 let src = materialized(&bindings, input)?;
                 let keys = runtime
-                    .block_on(collect_distinct(src, key, *cap))
+                    .block_on(collect_distinct(src, key))
                     .map_err(df_to_py)?;
                 bindings.insert(binding.clone(), Binding::Keys(keys));
             }
 
             Step::InjectedScan { datasource, scan, inject_column, keys_from, binding } => {
-                let extra = dynamic_filter(&bindings, keys_from, inject_column)?;
-                let batches = fetch_scan(datasource, scan, extra)?;
+                let keys = keys_binding(&bindings, keys_from)?;
+                let batches = run_injected_scan(datasource, scan, inject_column, keys)?;
                 bindings.insert(binding.clone(), Binding::Materialized(batches));
             }
 
@@ -117,70 +126,136 @@ fn materialized<'a>(
     }
 }
 
-/// Build the probe's dynamic `inject_column IN (...)` filter from a keys
-/// binding. None => over cap (full scan). Empty keys => `false` (no build rows
-/// can match, so the probe returns nothing).
-fn dynamic_filter(
-    bindings: &HashMap<String, Binding>,
+/// Borrow the distinct build-key values a keys binding holds.
+fn keys_binding<'a>(
+    bindings: &'a HashMap<String, Binding>,
     keys_from: &str,
-    inject_column: &str,
-) -> PyResult<Option<Expr>> {
-    let keys = match bindings.get(keys_from) {
-        Some(Binding::Keys(k)) => k,
-        _ => {
-            return Err(PyRuntimeError::new_err(format!(
-                "binding '{keys_from}' does not hold distinct keys"
-            )))
-        }
-    };
-    let batches = match keys {
-        None => return Ok(None),
-        Some(b) => b,
-    };
+) -> PyResult<&'a Batches> {
+    match bindings.get(keys_from) {
+        Some(Binding::Keys(b)) => Ok(b),
+        _ => Err(PyRuntimeError::new_err(format!(
+            "binding '{keys_from}' does not hold distinct keys"
+        ))),
+    }
+}
 
+/// Read the probe, reducing it by the build keys with the cheapest strategy for
+/// the key cardinality and estimated selectivity:
+///   - no keys  -> the probe matches nothing;
+///   - < IN_CAP -> inline `col IN (v1, ..)` and fetch;
+///   - selective -> push a TEMP TABLE of the keys and semi-join server-side;
+///   - unselective (would fetch > FULL_SCAN_FRACTION) -> parallel full scan.
+fn run_injected_scan(
+    datasource: &str,
+    scan: &ScanSpec,
+    inject_column: &str,
+    keys: &Batches,
+) -> PyResult<Batches> {
+    let num_keys: usize = keys.batches.iter().map(|b| b.num_rows()).sum();
+
+    if num_keys == 0 {
+        return fetch_scan(datasource, scan, Some(lit(false)));
+    }
+    if num_keys < IN_CAP {
+        let filter = in_list_filter(keys, inject_column)?;
+        return fetch_scan(datasource, scan, Some(filter));
+    }
+    if fetches_most_of_table(datasource, scan, inject_column, num_keys)? {
+        parallel_probe_scan(datasource, scan)
+    } else {
+        temp_table_probe(datasource, scan, keys, inject_column)
+    }
+}
+
+/// `inject_column IN (v1, v2, ...)` from the collected key values.
+fn in_list_filter(keys: &Batches, inject_column: &str) -> PyResult<Expr> {
     let mut values = Vec::new();
-    for batch in &batches.batches {
+    for batch in &keys.batches {
         let column = batch.column(0);
         for i in 0..batch.num_rows() {
             values.push(literal_from_array(column.as_ref(), i).map_err(df_to_py)?);
         }
     }
     let column = Expr::Column(Column::new(None::<TableReference>, inject_column.to_string()));
-    if values.is_empty() {
-        Ok(Some(lit(false)))
-    } else {
-        Ok(Some(Expr::InList(InList::new(Box::new(column), values, false))))
-    }
+    Ok(Expr::InList(InList::new(Box::new(column), values, false)))
 }
 
-/// DISTINCT of one key column, NULL-free, capped. None if the distinct count
-/// exceeds `cap` (over cap => no dynamic filter is pushed).
-async fn collect_distinct(
-    src: &Batches,
-    key: &str,
-    cap: usize,
-) -> Result<Option<Batches>, DataFusionError> {
+/// True when the dynamic filter is estimated to select more than
+/// `FULL_SCAN_FRACTION` of the probe (so a parallel full scan beats a semi-join).
+/// Unknown statistics => false (prefer the safe temp-table path).
+fn fetches_most_of_table(
+    datasource: &str,
+    scan: &ScanSpec,
+    inject_column: &str,
+    num_keys: usize,
+) -> PyResult<bool> {
+    let table = scan
+        .table
+        .as_deref()
+        .ok_or_else(|| PyRuntimeError::new_err("injected scan needs a structured table"))?;
+    let fraction =
+        connectors::estimate_selectivity(datasource, scan.schema.as_deref(), table, inject_column, num_keys)?;
+    Ok(fraction.map(|f| f > FULL_SCAN_FRACTION).unwrap_or(false))
+}
+
+/// Parallel ctid-partitioned full scan of the probe (base predicate only); the
+/// downstream DataFusion join does the reduction.
+fn parallel_probe_scan(datasource: &str, scan: &ScanSpec) -> PyResult<Batches> {
+    let kind = connectors::kind(datasource)?;
+    let table = scan
+        .table
+        .as_deref()
+        .ok_or_else(|| PyRuntimeError::new_err("parallel scan needs a structured table"))?;
+    let select = select_list_sql(scan);
+    let where_clause = base_filter_sql(kind, scan).map_err(df_to_py)?;
+    let (schema, batches) = connectors::fetch_parallel(
+        datasource,
+        scan.schema.as_deref(),
+        table,
+        &select,
+        PARALLEL_PARTITIONS,
+        where_clause.as_deref(),
+    )?;
+    Ok(Batches { schema, batches })
+}
+
+/// Temp-table pushdown: ingest the keys and semi-join them server-side.
+fn temp_table_probe(
+    datasource: &str,
+    scan: &ScanSpec,
+    keys: &Batches,
+    inject_column: &str,
+) -> PyResult<Batches> {
+    let kind = connectors::kind(datasource)?;
+    let key_col = keys.schema.field(0).name();
+    let sql = temp_join_sql(kind, scan, DYN_KEYS_TEMP_TABLE, key_col, inject_column).map_err(df_to_py)?;
+    let (schema, batches) = connectors::fetch_temp_join(
+        datasource,
+        DYN_KEYS_TEMP_TABLE,
+        keys.schema.clone(),
+        keys.batches.clone(),
+        &sql,
+    )?;
+    Ok(Batches { schema, batches })
+}
+
+/// DISTINCT of one key column, NULL-free (the full set; the strategy chosen in
+/// `run_injected_scan` decides how to apply it).
+async fn collect_distinct(src: &Batches, key: &str) -> Result<Batches, DataFusionError> {
     let ctx = SessionContext::new();
     let table = MemTable::try_new(src.schema.clone(), vec![src.batches.clone()])?;
     ctx.register_table("build", Arc::new(table))?;
 
-    // cap + 1 so we can distinguish "at cap" from "over cap".
     let df = ctx
         .table("build")
         .await?
         .filter(col(key).is_not_null())?
         .select(vec![col(key)])?
-        .distinct()?
-        .limit(0, Some(cap + 1))?;
+        .distinct()?;
 
     let schema = Arc::new(df.schema().as_arrow().clone());
     let batches = df.collect().await?;
-    let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-    if rows > cap {
-        Ok(None)
-    } else {
-        Ok(Some(Batches { schema, batches }))
-    }
+    Ok(Batches { schema, batches })
 }
 
 /// Register the fragment's inputs and run it on DataFusion.

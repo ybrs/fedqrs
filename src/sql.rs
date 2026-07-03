@@ -14,7 +14,7 @@ use datafusion::sql::unparser::Unparser;
 
 use crate::connectors::DsKind;
 use crate::expr::to_df_expr;
-use crate::ir::ScanSpec;
+use crate::ir::{IrExpr, ScanSpec};
 
 /// Render a DataFusion expression to SQL text in the default dialect. Used when
 /// building a local fragment's SQL (aggregate), which DataFusion itself parses.
@@ -106,4 +106,64 @@ pub fn scan_sql(
         sql.push_str(&format!(" LIMIT {n}"));
     }
     Ok(sql)
+}
+
+/// Render the scan's static filter to SQL (for the parallel-scan strategy,
+/// which applies the base predicate but not the dynamic key filter).
+pub fn base_filter_sql(kind: DsKind, scan: &ScanSpec) -> Result<Option<String>, DataFusionError> {
+    match &scan.filter {
+        Some(f) => Ok(Some(render_filter(kind, f)?)),
+        None => Ok(None),
+    }
+}
+
+/// The scan's SELECT column list as SQL (for the parallel-scan strategy).
+pub fn select_list_sql(scan: &ScanSpec) -> String {
+    let cols: Vec<String> = scan.columns.iter().map(|c| quote_ident(c)).collect();
+    cols.join(", ")
+}
+
+/// Build the temp-table pushdown query: the probe scan restricted to rows whose
+/// `inject_col` appears in the ingested keys temp table (a server-side semi-join).
+pub fn temp_join_sql(
+    kind: DsKind,
+    scan: &ScanSpec,
+    temp_table: &str,
+    key_col: &str,
+    inject_col: &str,
+) -> Result<String, DataFusionError> {
+    let table = scan
+        .table
+        .as_ref()
+        .ok_or_else(|| DataFusionError::Plan("temp-join needs a structured table".into()))?;
+    if scan.columns.is_empty() {
+        return Err(DataFusionError::Plan("temp-join scan has no columns".into()));
+    }
+
+    let mut sql = String::from("SELECT ");
+    sql.push_str(&select_list_sql(scan));
+    sql.push_str(" FROM ");
+    sql.push_str(&table_ref(scan, table));
+
+    let membership = format!(
+        "{} IN (SELECT {} FROM {})",
+        quote_ident(inject_col),
+        quote_ident(key_col),
+        quote_ident(temp_table)
+    );
+    let mut clauses = Vec::new();
+    if let Some(f) = &scan.filter {
+        clauses.push(render_filter(kind, f)?);
+    }
+    clauses.push(membership);
+    sql.push_str(" WHERE ");
+    sql.push_str(&clauses.join(" AND "));
+    Ok(sql)
+}
+
+/// Render one IR filter expression to SQL in the source dialect.
+fn render_filter(kind: DsKind, filter: &IrExpr) -> Result<String, DataFusionError> {
+    let dialect = dialect_for(kind);
+    let unparser = Unparser::new(dialect.as_ref());
+    Ok(unparser.expr_to_sql(&to_df_expr(filter)?)?.to_string())
 }

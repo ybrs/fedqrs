@@ -12,7 +12,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use arrow::array::{ArrayRef, Int64Array, RecordBatch, RecordBatchReader};
+use arrow::array::{Array, ArrayRef, Int64Array, RecordBatch, RecordBatchReader};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -116,35 +116,44 @@ fn fetch_postgres(
     s: &DsSpec,
     sql: &str,
 ) -> PyResult<(SchemaRef, Vec<RecordBatch>)> {
-    use adbc_core::{Connection, Statement};
-
     PG_CACHE.with(|cache| {
         let mut map = cache.borrow_mut();
         if !map.contains_key(name) {
-            let conn = open_pg(s).map_err(PyRuntimeError::new_err)?;
-            map.insert(name.to_string(), conn);
+            map.insert(name.to_string(), open_pg(s).map_err(PyRuntimeError::new_err)?);
         }
         let pg = map.get_mut(name).unwrap();
-
-        let mut stmt = pg
-            .conn
-            .new_statement()
-            .map_err(|e| PyRuntimeError::new_err(format!("adbc statement: {e}")))?;
-        stmt.set_sql_query(sql)
-            .map_err(|e| PyRuntimeError::new_err(format!("adbc set sql: {e}")))?;
-        let reader = stmt
-            .execute()
-            .map_err(|e| PyRuntimeError::new_err(format!("adbc execute: {e}")))?;
-
-        let schema = reader.schema();
-        let mut batches = Vec::new();
-        for batch in reader {
-            batches
-                .push(batch.map_err(|e| PyRuntimeError::new_err(format!("adbc batch: {e}")))?);
-        }
-        normalize_numeric(schema, batches)
-            .map_err(|e| PyRuntimeError::new_err(format!("numeric normalize: {e}")))
+        run_query(&mut pg.conn, sql).map_err(PyRuntimeError::new_err)
     })
+}
+
+type PgConnection = adbc_driver_manager::ManagedConnection;
+
+/// Run a query on a connection and return its (numeric-normalized) Arrow result.
+fn run_query(
+    conn: &mut PgConnection,
+    sql: &str,
+) -> Result<(SchemaRef, Vec<RecordBatch>), String> {
+    use adbc_core::{Connection, Statement};
+
+    let mut stmt = conn.new_statement().map_err(|e| format!("adbc statement: {e}"))?;
+    stmt.set_sql_query(sql).map_err(|e| format!("adbc set sql: {e}"))?;
+    let reader = stmt.execute().map_err(|e| format!("adbc execute: {e}"))?;
+    let schema = reader.schema();
+    let mut batches = Vec::new();
+    for batch in reader {
+        batches.push(batch.map_err(|e| format!("adbc batch: {e}"))?);
+    }
+    normalize_numeric(schema, batches).map_err(|e| format!("numeric normalize: {e}"))
+}
+
+/// Run a statement with no result set (DDL: DROP TABLE, etc.).
+fn exec_update(conn: &mut PgConnection, sql: &str) -> Result<(), String> {
+    use adbc_core::{Connection, Statement};
+
+    let mut stmt = conn.new_statement().map_err(|e| format!("adbc statement: {e}"))?;
+    stmt.set_sql_query(sql).map_err(|e| format!("adbc set sql: {e}"))?;
+    stmt.execute_update().map_err(|e| format!("adbc execute_update: {e}"))?;
+    Ok(())
 }
 
 /// Postgres `numeric`/`decimal` columns arrive over ADBC as an opaque
@@ -297,6 +306,7 @@ pub fn fetch_parallel(
     table: &str,
     select_list: &str,
     partitions: usize,
+    where_clause: Option<&str>,
 ) -> PyResult<(SchemaRef, Vec<RecordBatch>)> {
     let s = spec(name)?;
     if s.kind != DsKind::Postgres {
@@ -304,13 +314,17 @@ pub fn fetch_parallel(
     }
     let pages = relpages(name, schema, table)?;
     let table_ref = qualified_table(schema, table);
+    let extra = match where_clause {
+        Some(w) => format!(" AND ({w})"),
+        None => String::new(),
+    };
 
     let mut handles = Vec::new();
     for (lo, hi) in ctid_ranges(pages, partitions) {
         let worker_spec = s.clone();
         let sql = format!(
             "SELECT {select_list} FROM {table_ref} \
-             WHERE ctid >= '({lo},0)'::tid AND ctid < '({hi},0)'::tid"
+             WHERE ctid >= '({lo},0)'::tid AND ctid < '({hi},0)'::tid{extra}"
         );
         handles.push(std::thread::spawn(move || read_partition(&worker_spec, &sql)));
     }
@@ -328,6 +342,123 @@ pub fn fetch_parallel(
     let result_schema = result_schema
         .ok_or_else(|| PyRuntimeError::new_err("parallel fetch produced no partitions"))?;
     Ok((result_schema, all))
+}
+
+// --- temp-table dynamic-filter pushdown --------------------------------------
+//
+// For a high-cardinality dynamic filter (too many keys for an IN list, but
+// selective enough that a full scan wastes bandwidth), push the build keys into
+// a session TEMP TABLE on the probe connection and let Postgres do the reduction
+// server-side, transferring only matching rows. Ingest, join, and drop all run
+// on the one pooled connection (temp tables are session-local).
+
+/// Ingest key batches into a fresh TEMP TABLE via ADBC bulk ingest (binary COPY).
+fn ingest_temp(
+    conn: &mut PgConnection,
+    table: &str,
+    schema: SchemaRef,
+    batches: Vec<RecordBatch>,
+) -> Result<(), String> {
+    use adbc_core::options::{IngestMode, OptionStatement, OptionValue};
+    use adbc_core::{Connection, Optionable, Statement};
+
+    let mut stmt = conn.new_statement().map_err(|e| format!("adbc statement: {e}"))?;
+    stmt.set_option(OptionStatement::TargetTable, OptionValue::String(table.to_string()))
+        .map_err(|e| format!("adbc target table: {e}"))?;
+    stmt.set_option(OptionStatement::Temporary, OptionValue::String("true".to_string()))
+        .map_err(|e| format!("adbc temporary: {e}"))?;
+    stmt.set_option(OptionStatement::IngestMode, IngestMode::Create.into())
+        .map_err(|e| format!("adbc ingest mode: {e}"))?;
+
+    let items: Vec<Result<RecordBatch, arrow::error::ArrowError>> =
+        batches.into_iter().map(Ok).collect();
+    let reader = arrow::array::RecordBatchIterator::new(items.into_iter(), schema);
+    stmt.bind_stream(Box::new(reader)).map_err(|e| format!("adbc bind: {e}"))?;
+    stmt.execute_update().map_err(|e| format!("adbc ingest: {e}"))?;
+    Ok(())
+}
+
+/// Push `keys` into a temp table, run `join_sql` against it, drop it, and
+/// return the (reduced) Arrow result. All on the one pooled connection.
+pub fn fetch_temp_join(
+    name: &str,
+    temp_table: &str,
+    keys_schema: SchemaRef,
+    keys_batches: Vec<RecordBatch>,
+    join_sql: &str,
+) -> PyResult<(SchemaRef, Vec<RecordBatch>)> {
+    let s = spec(name)?;
+    if s.kind != DsKind::Postgres {
+        return Err(PyRuntimeError::new_err("temp-join pushdown is Postgres-only"));
+    }
+    let drop_sql = format!("DROP TABLE IF EXISTS \"{}\"", temp_table.replace('"', "\"\""));
+    PG_CACHE.with(|cache| {
+        let mut map = cache.borrow_mut();
+        if !map.contains_key(name) {
+            map.insert(name.to_string(), open_pg(&s).map_err(PyRuntimeError::new_err)?);
+        }
+        let pg = map.get_mut(name).unwrap();
+
+        exec_update(&mut pg.conn, &drop_sql).map_err(PyRuntimeError::new_err)?;
+        ingest_temp(&mut pg.conn, temp_table, keys_schema, keys_batches)
+            .map_err(PyRuntimeError::new_err)?;
+        let result = run_query(&mut pg.conn, join_sql);
+        // Best-effort cleanup; the ingest side already succeeded.
+        let _ = exec_update(&mut pg.conn, &drop_sql);
+        result.map_err(PyRuntimeError::new_err)
+    })
+}
+
+/// Estimate the fraction of the probe table a dynamic filter of `num_keys`
+/// distinct values would select, from `pg_class.reltuples` and the column's
+/// `pg_stats.n_distinct`. Returns None when statistics are unavailable (caller
+/// should then prefer the safe temp-table path). Used to choose between the
+/// temp-table pushdown and a full parallel scan.
+pub fn estimate_selectivity(
+    name: &str,
+    schema: Option<&str>,
+    table: &str,
+    column: &str,
+    num_keys: usize,
+) -> PyResult<Option<f64>> {
+    let pred = match schema {
+        Some(s) => format!("c.relname='{}' AND n.nspname='{}'", esc(table), esc(s)),
+        None => format!("c.relname='{}'", esc(table)),
+    };
+    let sql = format!(
+        "SELECT c.reltuples::float8, s.n_distinct FROM pg_class c \
+         JOIN pg_namespace n ON n.oid=c.relnamespace \
+         LEFT JOIN pg_stats s ON s.schemaname=n.nspname AND s.tablename=c.relname \
+         AND s.attname='{}' WHERE {pred}",
+        esc(column)
+    );
+    let (_, batches) = fetch(name, &sql)?;
+    Ok(selectivity_from_stats(&batches, num_keys))
+}
+
+/// Compute the selectivity estimate from the reltuples / n_distinct result.
+fn selectivity_from_stats(batches: &[RecordBatch], num_keys: usize) -> Option<f64> {
+    use arrow::array::Float64Array;
+
+    let batch = batches.iter().find(|b| b.num_rows() > 0)?;
+    let reltuples = batch.column(0).as_any().downcast_ref::<Float64Array>()?.value(0);
+    let ndist_col = batch.column(1).as_any().downcast_ref::<Float64Array>()?;
+    if ndist_col.is_null(0) {
+        return None;
+    }
+    let n_distinct = ndist_col.value(0);
+    // n_distinct: > 0 is an absolute count; < 0 is the negative fraction of rows.
+    let distinct = if n_distinct > 0.0 {
+        n_distinct
+    } else if n_distinct < 0.0 && reltuples > 0.0 {
+        -n_distinct * reltuples
+    } else {
+        return None;
+    };
+    if distinct <= 0.0 {
+        return None;
+    }
+    Some((num_keys as f64 / distinct).min(1.0))
 }
 
 /// Parse the `register_datasource` params dict into a spec.
