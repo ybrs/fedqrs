@@ -136,6 +136,14 @@ pub enum Fragment {
     Sort { keys: Vec<SortKey> },
     /// A boolean filter over a single input (`in_0`).
     Filter { predicate: IrExpr },
+    /// A LIMIT/OFFSET over a single input (`in_0`). `limit` is None for OFFSET
+    /// with no row cap.
+    Limit {
+        #[serde(default)]
+        limit: Option<usize>,
+        #[serde(default)]
+        offset: usize,
+    },
 }
 
 /// One ORDER BY key: an expression with sort direction and NULL placement.

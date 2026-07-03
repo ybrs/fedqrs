@@ -287,7 +287,20 @@ async fn run_fragment(
         }
         Fragment::Sort { keys } => run_sort(&ctx, keys).await,
         Fragment::Filter { predicate } => run_filter(&ctx, predicate).await,
+        Fragment::Limit { limit, offset } => run_limit(&ctx, *limit, *offset).await,
     }
+}
+
+/// Apply LIMIT/OFFSET over the single input `in_0`.
+async fn run_limit(
+    ctx: &SessionContext,
+    limit: Option<usize>,
+    offset: usize,
+) -> Result<Batches, DataFusionError> {
+    let limited = ctx.table("in_0").await?.limit(offset, limit)?;
+    let schema = Arc::new(limited.schema().as_arrow().clone());
+    let batches = limited.collect().await?;
+    Ok(Batches { schema, batches })
 }
 
 /// Filter the single input `in_0` by a boolean predicate.
