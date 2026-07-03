@@ -109,10 +109,20 @@ parse/bind/optimize/plan
   - PERF (benchmarks/tpch/run_engine_perf.py, sf0.1): single-source ~1x (both
     push to PG); cross-source join/agg/sort 1.4-2.6x faster in Rust (largest
     when per-operator overhead dominates, shrinking as I/O dominates).
+  - EXPERIMENT (reverted): streaming the probe (channel-bridged, thread per
+    probe) REGRESSED perf 1.5-2x. Cause: it dropped connection pooling (a fresh
+    ADBC connect per probe ~30ms; pooled fetch setup is 0.1ms), and for these
+    queries the fetch is fast so there was nothing to overlap. Materialization
+    was NOT the bottleneck. The real gap vs DuckDB on heavy joins is bulk-read
+    throughput: single-connection ADBC vs DuckDB's parallel/partitioned postgres
+    scan. Real lever = parallel/partitioned source reads, not probe streaming.
+    (Probe streaming would still help MEMORY on huge probes, but only if the
+    producer reuses a pooled connection.)
   - TODO: union/set-ops, outer/semi/anti joins, multi-key joins, window,
-    cross-source lateral; Decimal128 (exact) instead of Float64; native DuckDB +
-    ClickHouse connectors; concurrency benchmark; then make Rust the default
-    Executor path and remove the DuckDB merge engine (approval-gated).
+    cross-source lateral; Decimal128 (exact) instead of Float64; parallel/
+    partitioned reads (close the heavy-join gap); native DuckDB + ClickHouse
+    connectors; concurrency benchmark; then make Rust the default Executor path
+    and remove the DuckDB merge engine (approval-gated).
 
 ### Original phase notes
 
