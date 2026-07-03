@@ -10,10 +10,10 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
-use arrow::array::{RecordBatch, RecordBatchReader};
-use arrow::datatypes::SchemaRef;
+use arrow::array::{ArrayRef, RecordBatch, RecordBatchReader};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 
@@ -139,8 +139,64 @@ fn fetch_postgres(
             batches
                 .push(batch.map_err(|e| PyRuntimeError::new_err(format!("adbc batch: {e}")))?);
         }
-        Ok((schema, batches))
+        normalize_numeric(schema, batches)
+            .map_err(|e| PyRuntimeError::new_err(format!("numeric normalize: {e}")))
     })
+}
+
+/// Postgres `numeric`/`decimal` columns arrive over ADBC as an opaque
+/// string-backed extension type; DataFusion is strictly typed and will not do
+/// arithmetic on them. Cast such columns to `Float64` at the boundary (parsing
+/// the string values) so downstream operators see a real number. Float64 is a
+/// pragmatic choice; exact decimal semantics (Decimal128) can come later.
+fn normalize_numeric(
+    schema: SchemaRef,
+    batches: Vec<RecordBatch>,
+) -> Result<(SchemaRef, Vec<RecordBatch>), arrow::error::ArrowError> {
+    let numeric: Vec<usize> = schema
+        .fields()
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| {
+            matches!(
+                f.metadata().get("ADBC:postgresql:typname").map(String::as_str),
+                Some("numeric") | Some("decimal")
+            )
+        })
+        .map(|(i, _)| i)
+        .collect();
+    if numeric.is_empty() {
+        return Ok((schema, batches));
+    }
+
+    let fields: Vec<Arc<Field>> = schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(i, f)| {
+            if numeric.contains(&i) {
+                // Drop the extension metadata; the column is now a plain float.
+                Arc::new(Field::new(f.name(), DataType::Float64, f.is_nullable()))
+            } else {
+                f.clone()
+            }
+        })
+        .collect();
+    let new_schema = Arc::new(Schema::new(fields));
+
+    let mut out = Vec::with_capacity(batches.len());
+    for batch in batches {
+        let mut cols: Vec<ArrayRef> = Vec::with_capacity(batch.num_columns());
+        for (i, col) in batch.columns().iter().enumerate() {
+            if numeric.contains(&i) {
+                cols.push(arrow::compute::cast(col, &DataType::Float64)?);
+            } else {
+                cols.push(col.clone());
+            }
+        }
+        out.push(RecordBatch::try_new(new_schema.clone(), cols)?);
+    }
+    Ok((new_schema, out))
 }
 
 /// Parse the `register_datasource` params dict into a spec.
