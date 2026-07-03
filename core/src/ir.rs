@@ -182,7 +182,8 @@ pub struct AggSelectItem {
     pub alias: String,
 }
 
-/// An aggregate function call, e.g. `count(*)`, `sum(x)`, `count(DISTINCT y)`.
+/// An aggregate function call, e.g. `count(*)`, `sum(x)`, `count(DISTINCT y)`,
+/// or an ordered-set aggregate `percentile_cont(0.5) WITHIN GROUP (ORDER BY y)`.
 #[derive(Debug, Deserialize)]
 pub struct AggCall {
     pub func: String,
@@ -193,6 +194,17 @@ pub struct AggCall {
     pub star: bool,
     #[serde(default)]
     pub args: Vec<IrExpr>,
+    /// Present for an ordered-set aggregate: the `WITHIN GROUP (ORDER BY ...)`.
+    #[serde(default)]
+    pub within_group: Option<WithinGroup>,
+}
+
+/// The `WITHIN GROUP (ORDER BY key [DESC])` of an ordered-set aggregate.
+#[derive(Debug, Deserialize)]
+pub struct WithinGroup {
+    pub key: IrExpr,
+    #[serde(default)]
+    pub desc: bool,
 }
 
 /// An output column of a fragment: an expression aliased to a result name.

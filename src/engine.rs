@@ -417,7 +417,13 @@ fn render_agg(agg: &AggCall) -> Result<String, DataFusionError> {
         parts.join(", ")
     };
     let distinct = if agg.distinct { "DISTINCT " } else { "" };
-    Ok(format!("{}({}{})", agg.func, distinct, inner))
+    let mut sql = format!("{}({}{})", agg.func, distinct, inner);
+    if let Some(wg) = &agg.within_group {
+        let key = render_expr(&to_df_expr(&wg.key)?)?;
+        let direction = if wg.desc { " DESC" } else { "" };
+        sql.push_str(&format!(" WITHIN GROUP (ORDER BY {key}{direction})"));
+    }
+    Ok(sql)
 }
 
 /// Double-quote an identifier for a DataFusion SQL alias.
