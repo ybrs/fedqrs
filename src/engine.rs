@@ -204,7 +204,23 @@ async fn run_fragment(
         Fragment::Aggregate { select, group_by } => {
             run_aggregate(&ctx, select, group_by).await
         }
+        Fragment::Sort { keys } => run_sort(&ctx, keys).await,
     }
+}
+
+/// Order the single input `in_0` by the given keys.
+async fn run_sort(
+    ctx: &SessionContext,
+    keys: &[crate::ir::SortKey],
+) -> Result<Batches, DataFusionError> {
+    let mut sort_exprs = Vec::with_capacity(keys.len());
+    for k in keys {
+        sort_exprs.push(to_df_expr(&k.expr)?.sort(k.ascending, k.nulls_first));
+    }
+    let sorted = ctx.table("in_0").await?.sort(sort_exprs)?;
+    let schema = Arc::new(sorted.schema().as_arrow().clone());
+    let batches = sorted.collect().await?;
+    Ok(Batches { schema, batches })
 }
 
 /// Run a GROUP BY over the single input `in_0` by building DataFusion SQL, so

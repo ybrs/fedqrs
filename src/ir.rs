@@ -132,6 +132,16 @@ pub enum Fragment {
         #[serde(default)]
         group_by: Vec<IrExpr>,
     },
+    /// An ORDER BY over a single input (`in_0`).
+    Sort { keys: Vec<SortKey> },
+}
+
+/// One ORDER BY key: an expression with sort direction and NULL placement.
+#[derive(Debug, Deserialize)]
+pub struct SortKey {
+    pub expr: IrExpr,
+    pub ascending: bool,
+    pub nulls_first: bool,
 }
 
 /// One output column of an aggregate: exactly one of `expr` (a plain grouping
