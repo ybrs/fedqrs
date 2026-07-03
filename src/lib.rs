@@ -9,10 +9,9 @@
 
 mod connectors;
 mod engine;
-mod expr;
 mod ffi;
-mod ir;
-mod sql;
+
+use fedqrs_core::ir;
 
 use pyo3::exceptions::{PyValueError};
 use pyo3::prelude::*;

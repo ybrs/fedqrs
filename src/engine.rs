@@ -22,10 +22,10 @@ use pyo3::prelude::*;
 use tokio::runtime::Runtime;
 
 use crate::connectors;
-use crate::expr::{literal_from_array, to_df_expr};
 use crate::ffi::{stream_from_batches, ArrowStreamExport};
-use crate::ir::{AggCall, AggSelectItem, Fragment, Ir, JoinKind, Projection, ScanSpec, Step};
-use crate::sql::{base_filter_sql, render_expr, scan_sql, select_list_sql, temp_join_sql};
+use fedqrs_core::expr::{literal_from_array, to_df_expr};
+use fedqrs_core::ir::{AggCall, AggSelectItem, Fragment, Ir, JoinKind, Projection, ScanSpec, Step};
+use fedqrs_core::sql::{base_filter_sql, render_expr, scan_sql, select_list_sql, temp_join_sql};
 
 /// Dynamic-filter strategy thresholds. Under `IN_CAP` distinct keys we inline an
 /// IN list; above it we push a temp table unless the filter would select more
@@ -286,7 +286,7 @@ async fn run_fragment(
 /// Order the single input `in_0` by the given keys.
 async fn run_sort(
     ctx: &SessionContext,
-    keys: &[crate::ir::SortKey],
+    keys: &[fedqrs_core::ir::SortKey],
 ) -> Result<Batches, DataFusionError> {
     let mut sort_exprs = Vec::with_capacity(keys.len());
     for k in keys {
@@ -303,7 +303,7 @@ async fn run_sort(
 async fn run_aggregate(
     ctx: &SessionContext,
     select: &[AggSelectItem],
-    group_by: &[crate::ir::IrExpr],
+    group_by: &[fedqrs_core::ir::IrExpr],
 ) -> Result<Batches, DataFusionError> {
     let mut items = Vec::with_capacity(select.len());
     for item in select {
@@ -386,7 +386,7 @@ async fn run_hash_join(
     let lk: Vec<&str> = left_keys.iter().map(|s| s.as_str()).collect();
     let rk: Vec<&str> = right_keys.iter().map(|s| s.as_str()).collect();
 
-    let joined = left.join(right, join_type.into(), &lk, &rk, None)?;
+    let joined = left.join(right, datafusion_join_type(join_type), &lk, &rk, None)?;
     let projected = joined.select(project_exprs(project)?)?;
 
     let schema = Arc::new(projected.schema().as_arrow().clone());
@@ -394,16 +394,17 @@ async fn run_hash_join(
     Ok(Batches { schema, batches })
 }
 
-impl From<JoinKind> for JoinType {
-    fn from(k: JoinKind) -> Self {
-        match k {
-            JoinKind::Inner => JoinType::Inner,
-            JoinKind::Left => JoinType::Left,
-            JoinKind::Right => JoinType::Right,
-            JoinKind::Full => JoinType::Full,
-            JoinKind::Semi => JoinType::LeftSemi,
-            JoinKind::Anti => JoinType::LeftAnti,
-        }
+/// Map the IR join kind to DataFusion's. A free function, not a `From` impl:
+/// both types are external to this crate (JoinKind in fedqrs-core, JoinType in
+/// datafusion), so the orphan rule forbids the trait impl here.
+fn datafusion_join_type(k: JoinKind) -> JoinType {
+    match k {
+        JoinKind::Inner => JoinType::Inner,
+        JoinKind::Left => JoinType::Left,
+        JoinKind::Right => JoinType::Right,
+        JoinKind::Full => JoinType::Full,
+        JoinKind::Semi => JoinType::LeftSemi,
+        JoinKind::Anti => JoinType::LeftAnti,
     }
 }
 

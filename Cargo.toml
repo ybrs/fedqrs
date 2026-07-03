@@ -1,3 +1,6 @@
+[workspace]
+members = ["core"]
+
 [package]
 name = "fedqrs"
 version = "0.1.0"
@@ -40,8 +43,9 @@ arrow = { version = "58", features = ["ffi"] }
 arrow-array = "58"
 arrow-schema = "58"
 tokio = { version = "1", features = ["rt-multi-thread"] }
-serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# The pyo3-free engine core (IR, expr, sql, partitioning); unit-tested on its own.
+fedqrs-core = { path = "core" }
 # Native source drivers used by the engine. ADBC reads Postgres straight into
 # Arrow (the same C driver the Python path uses) and builds fast.
 adbc_core = "0.23"

@@ -17,11 +17,8 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum DsKind {
-    Postgres,
-    DuckDb,
-}
+use fedqrs_core::partition::{ctid_ranges, selectivity_from_stats};
+use fedqrs_core::types::DsKind;
 
 /// Connection parameters for one registered datasource. Parameters are stored
 /// (not a live handle) for now; pooling live connections is a later step.
@@ -259,27 +256,6 @@ fn relpages(name: &str, schema: Option<&str>, table: &str) -> PyResult<u32> {
     )))
 }
 
-/// Split [0, pages) into `partitions` half-open page ranges; the last extends to
-/// the max page so rows added since the last ANALYZE are still covered.
-fn ctid_ranges(pages: u32, partitions: usize) -> Vec<(u32, u32)> {
-    if pages == 0 {
-        return vec![(0, u32::MAX)];
-    }
-    let partitions = (partitions.max(1) as u32).min(pages);
-    let chunk = (pages / partitions).max(1);
-    let mut ranges = Vec::new();
-    let mut lo = 0u32;
-    while lo < pages {
-        let hi = lo.saturating_add(chunk);
-        ranges.push((lo, hi));
-        lo = hi;
-    }
-    if let Some(last) = ranges.last_mut() {
-        last.1 = u32::MAX;
-    }
-    ranges
-}
-
 const PARALLEL_WORKERS: usize = 8;
 
 type QueryResult = Result<(SchemaRef, Vec<RecordBatch>), String>;
@@ -469,31 +445,6 @@ pub fn estimate_selectivity(
     );
     let (_, batches) = fetch(name, &sql)?;
     Ok(selectivity_from_stats(&batches, num_keys))
-}
-
-/// Compute the selectivity estimate from the reltuples / n_distinct result.
-fn selectivity_from_stats(batches: &[RecordBatch], num_keys: usize) -> Option<f64> {
-    use arrow::array::Float64Array;
-
-    let batch = batches.iter().find(|b| b.num_rows() > 0)?;
-    let reltuples = batch.column(0).as_any().downcast_ref::<Float64Array>()?.value(0);
-    let ndist_col = batch.column(1).as_any().downcast_ref::<Float64Array>()?;
-    if ndist_col.is_null(0) {
-        return None;
-    }
-    let n_distinct = ndist_col.value(0);
-    // n_distinct: > 0 is an absolute count; < 0 is the negative fraction of rows.
-    let distinct = if n_distinct > 0.0 {
-        n_distinct
-    } else if n_distinct < 0.0 && reltuples > 0.0 {
-        -n_distinct * reltuples
-    } else {
-        return None;
-    };
-    if distinct <= 0.0 {
-        return None;
-    }
-    Some((num_keys as f64 / distinct).min(1.0))
 }
 
 /// Parse the `register_datasource` params dict into a spec.

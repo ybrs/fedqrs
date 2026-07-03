@@ -12,7 +12,7 @@ use datafusion::logical_expr::Expr;
 use datafusion::sql::unparser::dialect::{DefaultDialect, Dialect, PostgreSqlDialect};
 use datafusion::sql::unparser::Unparser;
 
-use crate::connectors::DsKind;
+use crate::types::DsKind;
 use crate::expr::to_df_expr;
 use crate::ir::{IrExpr, ScanSpec};
 
@@ -166,4 +166,50 @@ fn render_filter(kind: DsKind, filter: &IrExpr) -> Result<String, DataFusionErro
     let dialect = dialect_for(kind);
     let unparser = Unparser::new(dialect.as_ref());
     Ok(unparser.expr_to_sql(&to_df_expr(filter)?)?.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::ScanSpec;
+
+    fn scan(json: &str) -> ScanSpec {
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn renders_columns_table_and_filter() {
+        let s = scan(
+            r#"{"schema":"public","table":"t","columns":["a","b"],
+                "filter":{"node":"binary","op":">","left":{"node":"column","name":"a"},
+                          "right":{"node":"literal","value":{"lit":"int","value":5}}}}"#,
+        );
+        let sql = scan_sql(DsKind::Postgres, &s, None).unwrap();
+        assert!(sql.starts_with("SELECT \"a\", \"b\" FROM \"public\".\"t\""), "{sql}");
+        assert!(sql.contains("WHERE"), "{sql}");
+        assert!(sql.contains('5'), "{sql}");
+    }
+
+    #[test]
+    fn raw_sql_passes_through_and_refuses_injection() {
+        let s = scan(r#"{"raw_sql":"SELECT 1"}"#);
+        assert_eq!(scan_sql(DsKind::Postgres, &s, None).unwrap(), "SELECT 1");
+        // a dynamic filter cannot be spliced into opaque SQL
+        assert!(scan_sql(DsKind::Postgres, &s, Some(datafusion::prelude::lit(true))).is_err());
+    }
+
+    #[test]
+    fn temp_join_is_a_membership_semijoin() {
+        let s = scan(r#"{"schema":"public","table":"probe","columns":["id","v"]}"#);
+        let sql = temp_join_sql(DsKind::Postgres, &s, "keys_tmp", "k", "id").unwrap();
+        assert!(sql.contains("FROM \"public\".\"probe\""), "{sql}");
+        assert!(sql.contains("\"id\" IN (SELECT \"k\" FROM \"keys_tmp\")"), "{sql}");
+    }
+
+    #[test]
+    fn base_filter_and_select_list_helpers() {
+        let s = scan(r#"{"table":"t","columns":["a","b"]}"#);
+        assert_eq!(select_list_sql(&s), "\"a\", \"b\"");
+        assert!(base_filter_sql(DsKind::Postgres, &s).unwrap().is_none());
+    }
 }

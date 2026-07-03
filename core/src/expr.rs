@@ -137,3 +137,45 @@ pub fn literal_from_array(
     let value = ScalarValue::try_from_array(array, index)?;
     Ok(lit(value))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::IrExpr;
+
+    fn parse(json: &str) -> IrExpr {
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn translates_binary_comparison() {
+        let e = parse(
+            r#"{"node":"binary","op":"=","left":{"node":"column","relation":"t","name":"a"},
+                "right":{"node":"literal","value":{"lit":"int","value":1}}}"#,
+        );
+        assert!(matches!(to_df_expr(&e).unwrap(), Expr::BinaryExpr(_)));
+    }
+
+    #[test]
+    fn rejects_unsupported_operator() {
+        let e = parse(
+            r#"{"node":"binary","op":"~~","left":{"node":"column","name":"a"},
+                "right":{"node":"column","name":"b"}}"#,
+        );
+        assert!(to_df_expr(&e).is_err());
+    }
+
+    #[test]
+    fn cast_and_is_null() {
+        let cast = parse(r#"{"node":"cast","expr":{"node":"column","name":"a"},"to":"int64"}"#);
+        assert!(matches!(to_df_expr(&cast).unwrap(), Expr::Cast(_)));
+        let isnull = parse(r#"{"node":"is_null","expr":{"node":"column","name":"a"},"negated":true}"#);
+        assert!(to_df_expr(&isnull).is_ok());
+    }
+
+    #[test]
+    fn rejects_unknown_cast_type() {
+        let e = parse(r#"{"node":"cast","expr":{"node":"column","name":"a"},"to":"jsonb"}"#);
+        assert!(to_df_expr(&e).is_err());
+    }
+}

@@ -249,3 +249,47 @@ pub enum LiteralValue {
     Bool { value: bool },
     Null,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_step_and_fragment_tags() {
+        let ir: Ir = serde_json::from_str(
+            r#"{"outputs":["x"],"steps":[
+                 {"op":"source_scan","datasource":"pg","scan":{"raw_sql":"SELECT 1"},"binding":"b1"},
+                 {"op":"collect_distinct","input":"b1","key":"k","cap":2000,"binding":"b2"},
+                 {"op":"injected_scan","datasource":"pg","scan":{"table":"t","columns":["k"]},
+                  "inject_column":"k","keys_from":"b2","binding":"b3"},
+                 {"op":"merge","fragment":"f","inputs":{"in_0":"b3"},"binding":"b4"},
+                 {"op":"return","input":"b4"}],
+               "fragments":{"f":{"kind":"aggregate","select":[
+                  {"agg":{"func":"COUNT","distinct":false,"star":true,"args":[]},"alias":"n"}],
+                  "group_by":[]}}}"#,
+        )
+        .unwrap();
+        assert_eq!(ir.steps.len(), 5);
+        assert!(matches!(ir.steps[0], Step::SourceScan { .. }));
+        assert!(matches!(ir.steps[2], Step::InjectedScan { .. }));
+        assert!(matches!(ir.steps[4], Step::Return { .. }));
+        assert!(matches!(ir.fragments.get("f"), Some(Fragment::Aggregate { .. })));
+    }
+
+    #[test]
+    fn scanspec_defaults_apply() {
+        // Only table+columns given; optional fields default.
+        let s: ScanSpec =
+            serde_json::from_str(r#"{"table":"t","columns":["a"]}"#).unwrap();
+        assert_eq!(s.table.as_deref(), Some("t"));
+        assert!(s.raw_sql.is_none() && s.filter.is_none() && !s.distinct);
+    }
+
+    #[test]
+    fn rejects_unknown_op() {
+        assert!(serde_json::from_str::<Ir>(
+            r#"{"steps":[{"op":"teleport","binding":"b"}],"fragments":{}}"#
+        )
+        .is_err());
+    }
+}
