@@ -134,6 +134,8 @@ pub enum Fragment {
     },
     /// An ORDER BY over a single input (`in_0`).
     Sort { keys: Vec<SortKey> },
+    /// A boolean filter over a single input (`in_0`).
+    Filter { predicate: IrExpr },
 }
 
 /// One ORDER BY key: an expression with sort direction and NULL placement.

@@ -286,7 +286,19 @@ async fn run_fragment(
             run_aggregate(&ctx, select, group_by).await
         }
         Fragment::Sort { keys } => run_sort(&ctx, keys).await,
+        Fragment::Filter { predicate } => run_filter(&ctx, predicate).await,
     }
+}
+
+/// Filter the single input `in_0` by a boolean predicate.
+async fn run_filter(
+    ctx: &SessionContext,
+    predicate: &fedqrs_core::ir::IrExpr,
+) -> Result<Batches, DataFusionError> {
+    let filtered = ctx.table("in_0").await?.filter(to_df_expr(predicate)?)?;
+    let schema = Arc::new(filtered.schema().as_arrow().clone());
+    let batches = filtered.collect().await?;
+    Ok(Batches { schema, batches })
 }
 
 /// Order the single input `in_0` by the given keys.
