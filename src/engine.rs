@@ -23,6 +23,7 @@ use tokio::runtime::Runtime;
 
 use crate::connectors;
 use crate::ffi::{stream_from_batches, ArrowStreamExport};
+use fedqrs_core::types::DsKind;
 use fedqrs_core::expr::{literal_from_array, to_df_expr};
 use fedqrs_core::ir::{AggCall, AggSelectItem, Fragment, Ir, JoinKind, Projection, ScanSpec, Step};
 use fedqrs_core::sql::{base_filter_sql, render_expr, scan_sql, select_list_sql, temp_join_sql};
@@ -159,6 +160,11 @@ fn run_injected_scan(
     if num_keys < IN_CAP {
         let filter = in_list_filter(keys, inject_column)?;
         return fetch_scan(datasource, scan, Some(filter));
+    }
+    // The temp-table ingest and parallel ctid scan are Postgres-specific. For
+    // other sources, fetch the probe in full and let the DataFusion join reduce.
+    if connectors::kind(datasource)? != DsKind::Postgres {
+        return fetch_scan(datasource, scan, None);
     }
     if fetches_most_of_table(datasource, scan, inject_column, num_keys)? {
         parallel_probe_scan(datasource, scan)

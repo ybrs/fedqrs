@@ -27,7 +27,6 @@ bench = [
     "dep:uuid",
     "dep:chrono",
     "dep:connectorx",
-    "dep:duckdb",
 ]
 
 [dependencies]
@@ -50,13 +49,14 @@ fedqrs-core = { path = "core" }
 # Arrow (the same C driver the Python path uses) and builds fast.
 adbc_core = "0.23"
 adbc_driver_manager = "0.23"
+# Native DuckDB source connector (reads .duckdb files straight into Arrow).
+duckdb = { version = "1.3", features = ["bundled", "appender-arrow"] }
 
 # Benchmark-only dependencies (see the `bench` feature).
 postgres = { version = "0.19", features = ["with-uuid-1", "with-chrono-0_4"], optional = true }
 uuid = { version = "1", optional = true }
 chrono = { version = "0.4", optional = true }
 connectorx = { version = "0.4", default-features = false, features = ["src_postgres", "dst_arrow", "fptr"], optional = true }
-duckdb = { version = "1.3", features = ["bundled", "appender-arrow"], optional = true }
 
 [patch.crates-io]
 # Vendored fork: the only change is ArrowVTab streaming batches > 2048 rows
