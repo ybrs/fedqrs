@@ -99,12 +99,20 @@ parse/bind/optimize/plan
   - DONE: aggregate fragment (cross-source GROUP BY, built as DataFusion SQL so
     every agg function works; count(*) handled).
   - DONE: sort fragment (ORDER BY with direction + NULL placement).
-  - All parity-tested vs the DuckDB path in tests/test_rust_engine.py (6 tests).
+  - DONE: thread-local Postgres connection pool (reuse driver+connection).
+  - DONE: decimal-on-read - PG numeric arrives over ADBC as opaque strings;
+    cast to Float64 at the fetch boundary so decimal arithmetic/SUM runs
+    (matches DuckDB to float precision).
+  - All parity-tested vs the DuckDB path in tests/test_rust_engine.py (7 tests).
   - Adding an operator is now a fixed 4-step template: ir.rs Fragment variant ->
     engine.rs run_* -> rust_ir.py _emit_* -> a parity test.
+  - PERF (benchmarks/tpch/run_engine_perf.py, sf0.1): single-source ~1x (both
+    push to PG); cross-source join/agg/sort 1.4-2.6x faster in Rust (largest
+    when per-operator overhead dominates, shrinking as I/O dominates).
   - TODO: union/set-ops, outer/semi/anti joins, multi-key joins, window,
-    cross-source lateral; native DuckDB + ClickHouse connectors; then make Rust
-    the default Executor path and remove the DuckDB merge engine (approval-gated).
+    cross-source lateral; Decimal128 (exact) instead of Float64; native DuckDB +
+    ClickHouse connectors; concurrency benchmark; then make Rust the default
+    Executor path and remove the DuckDB merge engine (approval-gated).
 
 ### Original phase notes
 
