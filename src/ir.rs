@@ -112,13 +112,18 @@ pub struct ScanSpec {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Fragment {
-    /// An equi-join of two inputs on paired key columns, then a projection.
+    /// An equi-join of two inputs (`in_left`, `in_right`) on paired key columns.
+    /// `project` produces the join's canonical output columns so a parent
+    /// fragment can reference them; a user SELECT list is a separate `Project`.
     HashJoin {
         join_type: JoinKind,
         left_keys: Vec<String>,
         right_keys: Vec<String>,
         project: Vec<Projection>,
     },
+    /// A projection over a single input (`in_0`): evaluate each expression and
+    /// alias it to the output column name.
+    Project { project: Vec<Projection> },
 }
 
 /// An output column of a fragment: an expression aliased to a result name.

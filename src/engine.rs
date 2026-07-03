@@ -200,7 +200,29 @@ async fn run_fragment(
         Fragment::HashJoin { join_type, left_keys, right_keys, project } => {
             run_hash_join(&ctx, *join_type, left_keys, right_keys, project).await
         }
+        Fragment::Project { project } => run_project(&ctx, project).await,
     }
+}
+
+/// Evaluate a projection over the single input `in_0`.
+async fn run_project(
+    ctx: &SessionContext,
+    project: &[Projection],
+) -> Result<Batches, DataFusionError> {
+    let df = ctx.table("in_0").await?;
+    let projected = df.select(project_exprs(project)?)?;
+    let schema = Arc::new(projected.schema().as_arrow().clone());
+    let batches = projected.collect().await?;
+    Ok(Batches { schema, batches })
+}
+
+/// Build the aliased DataFusion expressions for a projection list.
+fn project_exprs(project: &[Projection]) -> Result<Vec<Expr>, DataFusionError> {
+    let mut exprs = Vec::with_capacity(project.len());
+    for p in project {
+        exprs.push(to_df_expr(&p.expr)?.alias(p.alias.as_str()));
+    }
+    Ok(exprs)
 }
 
 async fn run_hash_join(
@@ -216,12 +238,7 @@ async fn run_hash_join(
     let rk: Vec<&str> = right_keys.iter().map(|s| s.as_str()).collect();
 
     let joined = left.join(right, join_type.into(), &lk, &rk, None)?;
-
-    let mut exprs = Vec::with_capacity(project.len());
-    for p in project {
-        exprs.push(to_df_expr(&p.expr)?.alias(p.alias.as_str()));
-    }
-    let projected = joined.select(exprs)?;
+    let projected = joined.select(project_exprs(project)?)?;
 
     let schema = Arc::new(projected.schema().as_arrow().clone());
     let batches = projected.collect().await?;
