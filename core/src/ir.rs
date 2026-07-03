@@ -144,6 +144,10 @@ pub enum Fragment {
         #[serde(default)]
         offset: usize,
     },
+    /// Run a pre-rendered SQL statement over the merge inputs (registered under
+    /// their names). The escape hatch for a whole WITH / CTE that Python already
+    /// rendered; DataFusion parses and executes it.
+    RawSql { sql: String },
 }
 
 /// One ORDER BY key: an expression with sort direction and NULL placement.

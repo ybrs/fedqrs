@@ -288,7 +288,16 @@ async fn run_fragment(
         Fragment::Sort { keys } => run_sort(&ctx, keys).await,
         Fragment::Filter { predicate } => run_filter(&ctx, predicate).await,
         Fragment::Limit { limit, offset } => run_limit(&ctx, *limit, *offset).await,
+        Fragment::RawSql { sql } => run_raw_sql(&ctx, sql).await,
     }
+}
+
+/// Run pre-rendered SQL over the registered merge inputs (e.g. a whole CTE).
+async fn run_raw_sql(ctx: &SessionContext, sql: &str) -> Result<Batches, DataFusionError> {
+    let df = ctx.sql(sql).await?;
+    let schema = Arc::new(df.schema().as_arrow().clone());
+    let batches = df.collect().await?;
+    Ok(Batches { schema, batches })
 }
 
 /// Apply LIMIT/OFFSET over the single input `in_0`.
