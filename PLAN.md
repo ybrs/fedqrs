@@ -163,3 +163,37 @@ parse/bind/optimize/plan
 - NULL-aware semi/anti semantics preserved; NULL keys excluded from the IN list.
 - Scalar-subquery cardinality guard (SingleRowGuard) still raises.
 - Result schema/column names match what the Python after-processors expect.
+
+## Testing
+
+- `cargo test -p fedqrs-core` — 18 Rust unit tests, no DB / no Python: ctid
+  partitioning, selectivity estimate, IR serde, expr->DataFusion translation,
+  source-SQL emission. (The pyo3 `fedqrs` crate itself cannot be `cargo test`ed
+  in envs with no shared libpython; its logic lives in `fedqrs-core`.)
+- `federated-query/tests/test_rust_engine.py` — 8 integration/parity tests
+  against live Postgres: single-source, cross-source join (+ pushed filter),
+  aggregate, decimal aggregate, order-by, high-cardinality dynamic filter, and a
+  fail-loud guard. Each asserts the Rust result equals the DuckDB merge path.
+
+## Remaining to complete the replacement
+
+Roughly in priority order:
+
+1. Operator parity (so more of the real suite routes through Rust):
+   - non-INNER joins (LEFT/RIGHT/FULL/SEMI/ANTI) + multi-key joins;
+   - union / INTERSECT / EXCEPT; DISTINCT; window functions;
+   - cross-source lateral join (magic-set / domain executor);
+   - general merge-side expression IR (CASE, function calls, more casts) - today
+     projections/filters cover column/literal/binary/cast/in-list/is-null.
+2. Single-source-subtree emission in Rust via DataFusion `plan_to_sql` (today a
+   complex single-source subtree is passed through as Python-emitted `raw_sql`).
+3. Native connectors beyond Postgres: DuckDB and ClickHouse (the temp-table and
+   parallel strategies are currently Postgres-only; other sources fall back).
+4. Correctness/precision: Decimal128 (exact) instead of Float64 for PG numeric;
+   NULL-aware semi/anti parity for the new join types.
+5. Robustness: connection-pool lifecycle/limits; spill/out-of-core for large
+   local joins/sorts (DuckDB spills today, DataFusion less so); a Rust bench
+   binary so perf comparisons don't need Python.
+6. The cutover: expand the Executor to route all supported plans through Rust,
+   run the full 900+ test suite against it, then remove the DuckDB merge engine
+   (`merge_engine.py`) - approval-gated per the no-delete-without-approval rule.
