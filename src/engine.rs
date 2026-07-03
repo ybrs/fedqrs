@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use arrow::array::RecordBatch;
-use arrow::datatypes::SchemaRef;
+use arrow::datatypes::{Field, Schema, SchemaRef};
 use datafusion::common::{Column, DataFusionError, JoinType, TableReference};
 use datafusion::datasource::MemTable;
 use datafusion::logical_expr::expr::InList;
@@ -389,20 +389,48 @@ async fn run_project(
     ctx: &SessionContext,
     project: &[Projection],
 ) -> Result<Batches, DataFusionError> {
-    let df = ctx.table("in_0").await?;
-    let projected = df.select(project_exprs(project)?)?;
-    let schema = Arc::new(projected.schema().as_arrow().clone());
+    project_dataframe(ctx.table("in_0").await?, project).await
+}
+
+/// Project a DataFrame to its output columns. Each expression is aliased to a
+/// unique internal name (DataFusion requires unique projection names), then the
+/// result schema is renamed to the intended output names - which MAY repeat, as
+/// SQL allows (`SELECT a, a`, self-joins); Arrow permits duplicate field names.
+async fn project_dataframe(
+    df: datafusion::dataframe::DataFrame,
+    project: &[Projection],
+) -> Result<Batches, DataFusionError> {
+    let mut exprs = Vec::with_capacity(project.len());
+    for (i, p) in project.iter().enumerate() {
+        exprs.push(to_df_expr(&p.expr)?.alias(format!("__c{i}")));
+    }
+    let projected = df.select(exprs)?;
+    let internal = projected.schema().as_arrow().clone();
     let batches = projected.collect().await?;
+    let schema = output_schema(&internal, project);
+    let batches = reschema(batches, &schema)?;
     Ok(Batches { schema, batches })
 }
 
-/// Build the aliased DataFusion expressions for a projection list.
-fn project_exprs(project: &[Projection]) -> Result<Vec<Expr>, DataFusionError> {
-    let mut exprs = Vec::with_capacity(project.len());
-    for p in project {
-        exprs.push(to_df_expr(&p.expr)?.alias(p.alias.as_str()));
+/// The output schema: internal column types under the intended output names.
+fn output_schema(internal: &Schema, project: &[Projection]) -> SchemaRef {
+    let mut fields = Vec::with_capacity(project.len());
+    for (field, p) in internal.fields().iter().zip(project) {
+        fields.push(Field::new(&p.alias, field.data_type().clone(), field.is_nullable()));
     }
-    Ok(exprs)
+    Arc::new(Schema::new(fields))
+}
+
+/// Rebuild each batch under `schema` (same columns, renamed fields).
+fn reschema(
+    batches: Vec<RecordBatch>,
+    schema: &SchemaRef,
+) -> Result<Vec<RecordBatch>, DataFusionError> {
+    let mut out = Vec::with_capacity(batches.len());
+    for batch in batches {
+        out.push(RecordBatch::try_new(schema.clone(), batch.columns().to_vec())?);
+    }
+    Ok(out)
 }
 
 async fn run_hash_join(
@@ -418,11 +446,7 @@ async fn run_hash_join(
     let rk: Vec<&str> = right_keys.iter().map(|s| s.as_str()).collect();
 
     let joined = left.join(right, datafusion_join_type(join_type), &lk, &rk, None)?;
-    let projected = joined.select(project_exprs(project)?)?;
-
-    let schema = Arc::new(projected.schema().as_arrow().clone());
-    let batches = projected.collect().await?;
-    Ok(Batches { schema, batches })
+    project_dataframe(joined, project).await
 }
 
 /// Map the IR join kind to DataFusion's. A free function, not a `From` impl:
