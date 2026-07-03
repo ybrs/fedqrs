@@ -24,8 +24,8 @@ use tokio::runtime::Runtime;
 use crate::connectors;
 use crate::expr::{literal_from_array, to_df_expr};
 use crate::ffi::{stream_from_batches, ArrowStreamExport};
-use crate::ir::{Fragment, Ir, JoinKind, Projection, ScanSpec, Step};
-use crate::sql::scan_sql;
+use crate::ir::{AggCall, AggSelectItem, Fragment, Ir, JoinKind, Projection, ScanSpec, Step};
+use crate::sql::{render_expr, scan_sql};
 
 /// Fully-read Arrow data with its schema.
 struct Batches {
@@ -201,7 +201,65 @@ async fn run_fragment(
             run_hash_join(&ctx, *join_type, left_keys, right_keys, project).await
         }
         Fragment::Project { project } => run_project(&ctx, project).await,
+        Fragment::Aggregate { select, group_by } => {
+            run_aggregate(&ctx, select, group_by).await
+        }
     }
+}
+
+/// Run a GROUP BY over the single input `in_0` by building DataFusion SQL, so
+/// every aggregate function DataFusion knows works without per-function wiring.
+async fn run_aggregate(
+    ctx: &SessionContext,
+    select: &[AggSelectItem],
+    group_by: &[crate::ir::IrExpr],
+) -> Result<Batches, DataFusionError> {
+    let mut items = Vec::with_capacity(select.len());
+    for item in select {
+        let rendered = match (&item.agg, &item.expr) {
+            (Some(agg), _) => render_agg(agg)?,
+            (None, Some(expr)) => render_expr(&to_df_expr(expr)?)?,
+            (None, None) => {
+                return Err(DataFusionError::Plan(
+                    "aggregate select item has neither expr nor agg".into(),
+                ))
+            }
+        };
+        items.push(format!("{rendered} AS {}", quote_ident(&item.alias)));
+    }
+
+    let mut sql = format!("SELECT {} FROM \"in_0\"", items.join(", "));
+    if !group_by.is_empty() {
+        let mut groups = Vec::with_capacity(group_by.len());
+        for g in group_by {
+            groups.push(render_expr(&to_df_expr(g)?)?);
+        }
+        sql.push_str(&format!(" GROUP BY {}", groups.join(", ")));
+    }
+
+    let df = ctx.sql(&sql).await?;
+    let schema = Arc::new(df.schema().as_arrow().clone());
+    let batches = df.collect().await?;
+    Ok(Batches { schema, batches })
+}
+
+fn render_agg(agg: &AggCall) -> Result<String, DataFusionError> {
+    let inner = if agg.star {
+        "*".to_string()
+    } else {
+        let mut parts = Vec::with_capacity(agg.args.len());
+        for a in &agg.args {
+            parts.push(render_expr(&to_df_expr(a)?)?);
+        }
+        parts.join(", ")
+    };
+    let distinct = if agg.distinct { "DISTINCT " } else { "" };
+    Ok(format!("{}({}{})", agg.func, distinct, inner))
+}
+
+/// Double-quote an identifier for a DataFusion SQL alias.
+fn quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
 }
 
 /// Evaluate a projection over the single input `in_0`.

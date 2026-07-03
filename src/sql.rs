@@ -16,6 +16,13 @@ use crate::connectors::DsKind;
 use crate::expr::to_df_expr;
 use crate::ir::ScanSpec;
 
+/// Render a DataFusion expression to SQL text in the default dialect. Used when
+/// building a local fragment's SQL (aggregate), which DataFusion itself parses.
+pub fn render_expr(e: &Expr) -> Result<String, DataFusionError> {
+    let unparser = Unparser::new(&DefaultDialect {});
+    Ok(unparser.expr_to_sql(e)?.to_string())
+}
+
 /// Quote an identifier for Postgres/DuckDB (double quotes, doubled internally).
 fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))

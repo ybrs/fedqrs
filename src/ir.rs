@@ -124,6 +124,38 @@ pub enum Fragment {
     /// A projection over a single input (`in_0`): evaluate each expression and
     /// alias it to the output column name.
     Project { project: Vec<Projection> },
+    /// A GROUP BY (or grand-total) aggregation over a single input (`in_0`).
+    /// `select` is the output list (aggregate calls and grouping expressions);
+    /// `group_by` is the grouping key list.
+    Aggregate {
+        select: Vec<AggSelectItem>,
+        #[serde(default)]
+        group_by: Vec<IrExpr>,
+    },
+}
+
+/// One output column of an aggregate: exactly one of `expr` (a plain grouping
+/// expression) or `agg` (an aggregate call), aliased to the output name.
+#[derive(Debug, Deserialize)]
+pub struct AggSelectItem {
+    #[serde(default)]
+    pub expr: Option<IrExpr>,
+    #[serde(default)]
+    pub agg: Option<AggCall>,
+    pub alias: String,
+}
+
+/// An aggregate function call, e.g. `count(*)`, `sum(x)`, `count(DISTINCT y)`.
+#[derive(Debug, Deserialize)]
+pub struct AggCall {
+    pub func: String,
+    #[serde(default)]
+    pub distinct: bool,
+    /// `count(*)` — no argument, counts rows.
+    #[serde(default)]
+    pub star: bool,
+    #[serde(default)]
+    pub args: Vec<IrExpr>,
 }
 
 /// An output column of a fragment: an expression aliased to a result name.
