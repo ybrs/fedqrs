@@ -281,6 +281,9 @@ async fn run_fragment(
         Fragment::HashJoin { join_type, left_keys, right_keys, project } => {
             run_hash_join(&ctx, *join_type, left_keys, right_keys, project).await
         }
+        Fragment::NestedLoopJoin { join_type, condition, project } => {
+            run_nested_loop_join(&ctx, *join_type, condition, project).await
+        }
         Fragment::Project { project } => run_project(&ctx, project).await,
         Fragment::Aggregate { select, group_by } => {
             run_aggregate(&ctx, select, group_by).await
@@ -455,6 +458,23 @@ async fn run_hash_join(
     let rk: Vec<&str> = right_keys.iter().map(|s| s.as_str()).collect();
 
     let joined = left.join(right, datafusion_join_type(join_type), &lk, &rk, None)?;
+    project_dataframe(joined, project).await
+}
+
+/// A non-equi (nested-loop) join on an arbitrary condition (`None` = cross join).
+async fn run_nested_loop_join(
+    ctx: &SessionContext,
+    join_type: JoinKind,
+    condition: &Option<fedqrs_core::ir::IrExpr>,
+    project: &[Projection],
+) -> Result<Batches, DataFusionError> {
+    let left = ctx.table("in_left").await?;
+    let right = ctx.table("in_right").await?;
+    let on_exprs = match condition {
+        Some(expr) => vec![to_df_expr(expr)?],
+        None => Vec::new(),
+    };
+    let joined = left.join_on(right, datafusion_join_type(join_type), on_exprs)?;
     project_dataframe(joined, project).await
 }
 

@@ -121,6 +121,15 @@ pub enum Fragment {
         right_keys: Vec<String>,
         project: Vec<Projection>,
     },
+    /// A non-equi (nested-loop) join of two inputs (`in_left`, `in_right`) on an
+    /// arbitrary boolean condition (`None` = cross join). `project` is the
+    /// canonical output column list, like `HashJoin`.
+    NestedLoopJoin {
+        join_type: JoinKind,
+        #[serde(default)]
+        condition: Option<IrExpr>,
+        project: Vec<Projection>,
+    },
     /// A projection over a single input (`in_0`): evaluate each expression and
     /// alias it to the output column name.
     Project { project: Vec<Projection> },
