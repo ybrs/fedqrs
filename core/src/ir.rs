@@ -140,6 +140,10 @@ pub enum Fragment {
         select: Vec<AggSelectItem>,
         #[serde(default)]
         group_by: Vec<IrExpr>,
+        /// When non-empty, the GROUP BY is `GROUPING SETS (...)`; each inner list
+        /// is one grouping set (ROLLUP/CUBE are pre-expanded to sets).
+        #[serde(default)]
+        grouping_sets: Vec<Vec<IrExpr>>,
     },
     /// An ORDER BY over a single input (`in_0`).
     Sort { keys: Vec<SortKey> },

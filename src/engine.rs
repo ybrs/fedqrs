@@ -285,8 +285,8 @@ async fn run_fragment(
             run_nested_loop_join(&ctx, *join_type, condition, project).await
         }
         Fragment::Project { project } => run_project(&ctx, project).await,
-        Fragment::Aggregate { select, group_by } => {
-            run_aggregate(&ctx, select, group_by).await
+        Fragment::Aggregate { select, group_by, grouping_sets } => {
+            run_aggregate(&ctx, select, group_by, grouping_sets).await
         }
         Fragment::Sort { keys } => run_sort(&ctx, keys).await,
         Fragment::Filter { predicate } => run_filter(&ctx, predicate).await,
@@ -347,6 +347,7 @@ async fn run_aggregate(
     ctx: &SessionContext,
     select: &[AggSelectItem],
     group_by: &[fedqrs_core::ir::IrExpr],
+    grouping_sets: &[Vec<fedqrs_core::ir::IrExpr>],
 ) -> Result<Batches, DataFusionError> {
     let mut items = Vec::with_capacity(select.len());
     for item in select {
@@ -363,18 +364,46 @@ async fn run_aggregate(
     }
 
     let mut sql = format!("SELECT {} FROM \"in_0\"", items.join(", "));
-    if !group_by.is_empty() {
-        let mut groups = Vec::with_capacity(group_by.len());
-        for g in group_by {
-            groups.push(render_expr(&to_df_expr(g)?)?);
-        }
-        sql.push_str(&format!(" GROUP BY {}", groups.join(", ")));
-    }
+    sql.push_str(&group_by_clause(group_by, grouping_sets)?);
 
     let df = ctx.sql(&sql).await?;
     let schema = Arc::new(df.schema().as_arrow().clone());
     let batches = df.collect().await?;
     Ok(Batches { schema, batches })
+}
+
+/// The GROUP BY clause: `GROUPING SETS (...)` when sets are given, else a plain
+/// grouping key list, else empty.
+fn group_by_clause(
+    group_by: &[fedqrs_core::ir::IrExpr],
+    grouping_sets: &[Vec<fedqrs_core::ir::IrExpr>],
+) -> Result<String, DataFusionError> {
+    if !grouping_sets.is_empty() {
+        return grouping_sets_clause(grouping_sets);
+    }
+    if group_by.is_empty() {
+        return Ok(String::new());
+    }
+    let mut groups = Vec::with_capacity(group_by.len());
+    for g in group_by {
+        groups.push(render_expr(&to_df_expr(g)?)?);
+    }
+    Ok(format!(" GROUP BY {}", groups.join(", ")))
+}
+
+/// Render `GROUP BY GROUPING SETS ((a, b), (a), ())`.
+fn grouping_sets_clause(
+    grouping_sets: &[Vec<fedqrs_core::ir::IrExpr>],
+) -> Result<String, DataFusionError> {
+    let mut rendered = Vec::with_capacity(grouping_sets.len());
+    for set in grouping_sets {
+        let mut cols = Vec::with_capacity(set.len());
+        for expr in set {
+            cols.push(render_expr(&to_df_expr(expr)?)?);
+        }
+        rendered.push(format!("({})", cols.join(", ")));
+    }
+    Ok(format!(" GROUP BY GROUPING SETS ({})", rendered.join(", ")))
 }
 
 fn render_agg(agg: &AggCall) -> Result<String, DataFusionError> {
