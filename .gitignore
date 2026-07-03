@@ -1,0 +1,4 @@
+/target
+/vendor/duckdb/target
+*.pyc
+__pycache__/
