@@ -109,6 +109,16 @@ parse/bind/optimize/plan
   - PERF (benchmarks/tpch/run_engine_perf.py, sf0.1): single-source ~1x (both
     push to PG); cross-source join/agg/sort 1.4-2.6x faster in Rust (largest
     when per-operator overhead dominates, shrinking as I/O dominates).
+  - DONE: dynamic-filter strategy selection, all in Rust (connectors.rs +
+    engine.rs). Injected probe scan picks by key cardinality + estimated
+    selectivity: <2000 keys -> IN list; else <=40% of probe -> TEMP TABLE ingest
+    (adbc bulk COPY) + server-side semi-join; else >40% -> parallel ctid full
+    scan. Selectivity from pg_class.reltuples + pg_stats.n_distinct (cast to
+    float8 - the float4 downcast was silently failing and defaulting everything
+    to temp-table). Parallel scan uses a persistent pooled worker-thread set.
+  - PERF vs DuckDB-over-Postgres (sf0.1): cross-source joins now 0.69-1.55x of
+    DuckDB (heavy join 181ms -> 63ms after the estimate fix; isolated parallel
+    scan 30ms, faster than DuckDB's 42ms). 1.9-2.7x faster than the old engine.
   - EXPERIMENT (reverted): streaming the probe (channel-bridged, thread per
     probe) REGRESSED perf 1.5-2x. Cause: it dropped connection pooling (a fresh
     ADBC connect per probe ~30ms; pooled fetch setup is 0.1ms), and for these
