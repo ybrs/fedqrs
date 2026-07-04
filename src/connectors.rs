@@ -77,7 +77,92 @@ pub fn fetch(name: &str, sql: &str) -> PyResult<(SchemaRef, Vec<RecordBatch>)> {
     match s.kind {
         DsKind::Postgres => fetch_postgres(name, &s, sql),
         DsKind::DuckDb => fetch_duckdb(&s, sql),
+        DsKind::Parquet => fetch_parquet(&s, sql),
     }
+}
+
+// A DataFusion runtime for reading Parquet sources. Source reads run in the
+// engine's sync step loop (not inside a block_on), so a dedicated runtime here
+// is safe to block on.
+fn parquet_runtime() -> &'static tokio::runtime::Runtime {
+    static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    RT.get_or_init(|| tokio::runtime::Runtime::new().expect("parquet tokio runtime"))
+}
+
+// Read a Parquet source by running the pushed SQL through DataFusion over the
+// directory's `<table>.parquet` files (registered under a `main` schema). This
+// gives DataFusion's native projection / filter / row-group pushdown - the fair
+// comparison point against DuckDB's read_parquet.
+fn fetch_parquet(s: &DsSpec, sql: &str) -> PyResult<(SchemaRef, Vec<RecordBatch>)> {
+    let ctx = parquet_ctx(&s.uri).map_err(|e| PyRuntimeError::new_err(format!("parquet: {e}")))?;
+    let sql = sql.to_string();
+    let result = parquet_runtime().block_on(async move {
+        let df = ctx.sql(&sql).await?;
+        let schema = std::sync::Arc::new(df.schema().as_arrow().clone());
+        let batches = df.collect().await?;
+        Ok::<(SchemaRef, Vec<RecordBatch>), datafusion::error::DataFusionError>((schema, batches))
+    });
+    result.map_err(|e| PyRuntimeError::new_err(format!("parquet query: {e}")))
+}
+
+// A DataFusion context per Parquet directory, built once (schema inference of
+// every file is not repeated per query) and reused - SessionContext is Arc-cheap
+// to clone.
+fn parquet_ctx(
+    dir: &str,
+) -> Result<datafusion::prelude::SessionContext, datafusion::error::DataFusionError> {
+    static CACHE: OnceLock<Mutex<HashMap<String, datafusion::prelude::SessionContext>>> =
+        OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut map = cache.lock().unwrap();
+    if let Some(ctx) = map.get(dir) {
+        return Ok(ctx.clone());
+    }
+    // Collect statistics from Parquet metadata so DataFusion's cost-based join
+    // reordering has real cardinalities (otherwise multi-joins pick bad plans).
+    let config = datafusion::execution::config::SessionConfig::new()
+        .with_collect_statistics(true);
+    let ctx = datafusion::prelude::SessionContext::new_with_config(config);
+    parquet_runtime().block_on(register_parquet_dir(&ctx, dir))?;
+    map.insert(dir.to_string(), ctx.clone());
+    Ok(ctx)
+}
+
+// Register every `<dir>/<table>.parquet` as `main.<table>` in `ctx`.
+async fn register_parquet_dir(
+    ctx: &datafusion::prelude::SessionContext,
+    dir: &str,
+) -> Result<(), datafusion::error::DataFusionError> {
+    use datafusion::catalog::SchemaProvider;
+    use datafusion::datasource::file_format::parquet::ParquetFormat;
+    use datafusion::datasource::listing::{
+        ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
+    };
+    let schema = std::sync::Arc::new(datafusion::catalog::MemorySchemaProvider::new());
+    let entries = std::fs::read_dir(dir)
+        .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?;
+    for entry in entries {
+        let path = entry
+            .map_err(|e| datafusion::error::DataFusionError::Execution(e.to_string()))?
+            .path();
+        if path.extension().and_then(|e| e.to_str()) != Some("parquet") {
+            continue;
+        }
+        let name = path.file_stem().unwrap().to_string_lossy().to_string();
+        let url = ListingTableUrl::parse(path.to_string_lossy())?;
+        let options = ListingOptions::new(std::sync::Arc::new(ParquetFormat::default()))
+            .with_collect_stat(true);
+        let file_schema = options.infer_schema(&ctx.state(), &url).await?;
+        let config = ListingTableConfig::new(url)
+            .with_listing_options(options)
+            .with_schema(file_schema);
+        let table = std::sync::Arc::new(ListingTable::try_new(config)?);
+        schema.register_table(name, table)?;
+    }
+    ctx.catalog("datafusion")
+        .unwrap()
+        .register_schema("main", schema)?;
+    Ok(())
 }
 
 fn open_duckdb(path: &str) -> Result<duckdb::Connection, String> {
@@ -487,6 +572,11 @@ pub fn spec_from_params(kind: &str, params: &Bound<'_, PyAny>) -> PyResult<DsSpe
             let uri = get("path")?
                 .ok_or_else(|| PyValueError::new_err("duckdb datasource needs 'path'"))?;
             Ok(DsSpec { kind: DsKind::DuckDb, uri, adbc_driver: None })
+        }
+        "parquet" => {
+            let uri = get("dir")?
+                .ok_or_else(|| PyValueError::new_err("parquet datasource needs 'dir'"))?;
+            Ok(DsSpec { kind: DsKind::Parquet, uri, adbc_driver: None })
         }
         other => Err(PyValueError::new_err(format!(
             "unknown datasource kind '{other}'"

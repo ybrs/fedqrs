@@ -5,4 +5,5 @@
 pub enum DsKind {
     Postgres,
     DuckDb,
+    Parquet,
 }

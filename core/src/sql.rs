@@ -48,6 +48,8 @@ fn dialect_for(kind: DsKind) -> Box<dyn Dialect> {
         DsKind::Postgres => Box::new(PostgreSqlDialect {}),
         // DuckDB SQL is standard enough for the default dialect for now.
         DsKind::DuckDb => Box::new(DefaultDialect {}),
+        // Parquet is read through DataFusion; the default dialect matches it.
+        DsKind::Parquet => Box::new(DefaultDialect {}),
     }
 }
 
