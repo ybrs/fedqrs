@@ -12,7 +12,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use arrow::array::{Array, ArrayRef, Int64Array, RecordBatch, RecordBatchReader};
+use arrow::array::{Array, ArrayRef, Int64Array, RecordBatch, RecordBatchReader, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -261,9 +261,10 @@ fn exec_update(conn: &mut PgConnection, sql: &str) -> Result<(), String> {
 
 /// Postgres `numeric`/`decimal` columns arrive over ADBC as an opaque
 /// string-backed extension type; DataFusion is strictly typed and will not do
-/// arithmetic on them. Cast such columns to `Float64` at the boundary (parsing
-/// the string values) so downstream operators see a real number. Float64 is a
-/// pragmatic choice; exact decimal semantics (Decimal128) can come later.
+/// arithmetic on them. Convert such columns to an exact `Decimal128(38, scale)`
+/// at the boundary. The scale is derived from the values themselves (the widest
+/// fractional part seen, over every batch) so nothing is rounded away - exact
+/// decimal arithmetic then matches Postgres/DuckDB to the last digit.
 fn normalize_numeric(
     schema: SchemaRef,
     batches: Vec<RecordBatch>,
@@ -284,34 +285,82 @@ fn normalize_numeric(
         return Ok((schema, batches));
     }
 
-    let fields: Vec<Arc<Field>> = schema
-        .fields()
-        .iter()
-        .enumerate()
-        .map(|(i, f)| {
-            if numeric.contains(&i) {
-                // Drop the extension metadata; the column is now a plain float.
-                Arc::new(Field::new(f.name(), DataType::Float64, f.is_nullable()))
-            } else {
-                f.clone()
-            }
-        })
-        .collect();
-    let new_schema = Arc::new(Schema::new(fields));
-
+    let (strings, scales) = decimal_strings_and_scales(&numeric, &batches)?;
+    let new_schema = decimal_schema(&schema, &scales);
     let mut out = Vec::with_capacity(batches.len());
-    for batch in batches {
+    for (bi, batch) in batches.iter().enumerate() {
         let mut cols: Vec<ArrayRef> = Vec::with_capacity(batch.num_columns());
         for (i, col) in batch.columns().iter().enumerate() {
-            if numeric.contains(&i) {
-                cols.push(arrow::compute::cast(col, &DataType::Float64)?);
-            } else {
-                cols.push(col.clone());
+            match scales.get(&i) {
+                Some(scale) => {
+                    let dtype = DataType::Decimal128(DECIMAL_PRECISION, *scale);
+                    cols.push(arrow::compute::cast(&strings[bi][&i], &dtype)?);
+                }
+                None => cols.push(col.clone()),
             }
         }
         out.push(RecordBatch::try_new(new_schema.clone(), cols)?);
     }
     Ok((new_schema, out))
+}
+
+/// Max Decimal128 precision; the scale is derived per column, leaving the rest
+/// for integer digits (ample for any real value).
+const DECIMAL_PRECISION: u8 = 38;
+
+/// For each numeric column, cast every batch's values to a Utf8 array (unwrapping
+/// the opaque extension) and record the widest fractional-digit count seen.
+fn decimal_strings_and_scales(
+    numeric: &[usize],
+    batches: &[RecordBatch],
+) -> Result<(Vec<HashMap<usize, ArrayRef>>, HashMap<usize, i8>), arrow::error::ArrowError> {
+    let mut scales: HashMap<usize, i8> = numeric.iter().map(|&i| (i, 0i8)).collect();
+    let mut strings: Vec<HashMap<usize, ArrayRef>> = Vec::with_capacity(batches.len());
+    for batch in batches {
+        let mut per_batch = HashMap::new();
+        for &i in numeric {
+            let utf8 = arrow::compute::cast(batch.column(i), &DataType::Utf8)?;
+            let observed = max_fractional_digits(utf8.as_any().downcast_ref::<StringArray>().unwrap());
+            let scale = scales.get_mut(&i).unwrap();
+            *scale = (*scale).max(observed);
+            per_batch.insert(i, utf8);
+        }
+        strings.push(per_batch);
+    }
+    Ok((strings, scales))
+}
+
+/// The widest number of digits after the decimal point in a string array.
+fn max_fractional_digits(values: &StringArray) -> i8 {
+    let mut widest = 0i8;
+    for row in 0..values.len() {
+        if values.is_null(row) {
+            continue;
+        }
+        if let Some(dot) = values.value(row).find('.') {
+            let frac = (values.value(row).len() - dot - 1).min(37) as i8;
+            widest = widest.max(frac);
+        }
+    }
+    widest
+}
+
+/// Rebuild the schema with each numeric column re-typed to its Decimal128 scale.
+fn decimal_schema(schema: &SchemaRef, scales: &HashMap<usize, i8>) -> SchemaRef {
+    let fields: Vec<Arc<Field>> = schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(i, f)| match scales.get(&i) {
+            Some(scale) => Arc::new(Field::new(
+                f.name(),
+                DataType::Decimal128(DECIMAL_PRECISION, *scale),
+                f.is_nullable(),
+            )),
+            None => f.clone(),
+        })
+        .collect();
+    Arc::new(Schema::new(fields))
 }
 
 // --- parallel partitioned scan -----------------------------------------------
