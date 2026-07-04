@@ -12,8 +12,9 @@ use arrow::array::Array;
 use arrow::datatypes::DataType;
 use datafusion::common::{Column, DataFusionError, ScalarValue, TableReference};
 use datafusion::functions::all_default_functions;
-use datafusion::logical_expr::expr::{Case, InList, ScalarFunction};
-use datafusion::logical_expr::{BinaryExpr, Cast, Expr, Operator, ScalarUDF};
+use datafusion::functions_aggregate::all_default_aggregate_functions;
+use datafusion::logical_expr::expr::{AggregateFunction, Case, InList, ScalarFunction};
+use datafusion::logical_expr::{AggregateUDF, BinaryExpr, Cast, Expr, Operator, ScalarUDF};
 use datafusion::prelude::lit;
 
 use crate::ir::{IrExpr, LiteralValue};
@@ -86,36 +87,55 @@ pub fn to_df_expr(e: &IrExpr) -> Result<Expr, DataFusionError> {
             })
         }
         IrExpr::Function { name, args } => {
-            let udf = scalar_udf(name)?;
             let mut df_args = Vec::with_capacity(args.len());
             for arg in args {
                 df_args.push(to_df_expr(arg)?);
             }
-            Ok(Expr::ScalarFunction(ScalarFunction::new_udf(udf, df_args)))
+            build_function(name, df_args)
         }
     }
 }
 
-/// Look up a scalar function by name (or alias) among DataFusion's built-ins.
-fn scalar_udf(name: &str) -> Result<Arc<ScalarUDF>, DataFusionError> {
+/// Build a scalar-or-aggregate function call by name. Scalars are tried first
+/// (`date_part`, `substr`, ...); an aggregate (`sum`, `avg`, ...) is allowed so
+/// an aggregate can appear inside a larger expression (e.g. `100 * sum(x) / sum(y)`).
+fn build_function(name: &str, args: Vec<Expr>) -> Result<Expr, DataFusionError> {
+    if let Some(udf) = scalar_registry().get(name).cloned() {
+        return Ok(Expr::ScalarFunction(ScalarFunction::new_udf(udf, args)));
+    }
+    if let Some(udf) = aggregate_registry().get(name).cloned() {
+        let call = AggregateFunction::new_udf(udf, args, false, None, Vec::new(), None);
+        return Ok(Expr::AggregateFunction(call));
+    }
+    Err(DataFusionError::Plan(format!("function '{name}' not supported")))
+}
+
+fn scalar_registry() -> &'static HashMap<String, Arc<ScalarUDF>> {
     static REGISTRY: OnceLock<HashMap<String, Arc<ScalarUDF>>> = OnceLock::new();
-    let registry = REGISTRY.get_or_init(build_scalar_registry);
-    registry
-        .get(name)
-        .cloned()
-        .ok_or_else(|| DataFusionError::Plan(format!("scalar function '{name}' not supported")))
+    REGISTRY.get_or_init(|| {
+        let mut map = HashMap::new();
+        for udf in all_default_functions() {
+            map.insert(udf.name().to_string(), udf.clone());
+            for alias in udf.aliases() {
+                map.insert(alias.to_string(), udf.clone());
+            }
+        }
+        map
+    })
 }
 
-/// Build the name/alias -> UDF map once from the default function set.
-fn build_scalar_registry() -> HashMap<String, Arc<ScalarUDF>> {
-    let mut map = HashMap::new();
-    for udf in all_default_functions() {
-        map.insert(udf.name().to_string(), udf.clone());
-        for alias in udf.aliases() {
-            map.insert(alias.to_string(), udf.clone());
+fn aggregate_registry() -> &'static HashMap<String, Arc<AggregateUDF>> {
+    static REGISTRY: OnceLock<HashMap<String, Arc<AggregateUDF>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| {
+        let mut map = HashMap::new();
+        for udf in all_default_aggregate_functions() {
+            map.insert(udf.name().to_string(), udf.clone());
+            for alias in udf.aliases() {
+                map.insert(alias.to_string(), udf.clone());
+            }
         }
-    }
-    map
+        map
+    })
 }
 
 fn scalar(v: &LiteralValue) -> ScalarValue {
