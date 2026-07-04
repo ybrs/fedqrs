@@ -109,6 +109,8 @@ fn operator(op: &str) -> Result<Operator, DataFusionError> {
         ">=" => Operator::GtEq,
         "and" => Operator::And,
         "or" => Operator::Or,
+        "like" => Operator::LikeMatch,
+        "ilike" => Operator::ILikeMatch,
         other => return plan_err(format!("unsupported binary operator '{other}'")),
     })
 }
