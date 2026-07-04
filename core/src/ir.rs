@@ -270,6 +270,13 @@ pub enum IrExpr {
         #[serde(default)]
         negated: bool,
     },
+    /// A scalar function call resolved by name against DataFusion's built-in
+    /// functions (e.g. `date_part`, `substr`). EXTRACT lowers to `date_part`.
+    Function {
+        name: String,
+        #[serde(default)]
+        args: Vec<IrExpr>,
+    },
 }
 
 #[derive(Debug, Clone, Deserialize)]
