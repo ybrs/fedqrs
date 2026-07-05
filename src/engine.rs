@@ -161,16 +161,32 @@ fn run_injected_scan(
         let filter = in_list_filter(keys, inject_column)?;
         return fetch_scan(datasource, scan, Some(filter));
     }
-    // The temp-table ingest and parallel ctid scan are Postgres-specific. For
-    // other sources, fetch the probe in full and let the DataFusion join reduce.
-    if connectors::kind(datasource)? != DsKind::Postgres {
+    let kind = connectors::kind(datasource)?;
+    // Parquet reads are in-process (DataFusion); the downstream join reduces
+    // without any transfer, so shipping keys anywhere would be pointless.
+    if kind == DsKind::Parquet {
+        return fetch_scan(datasource, scan, None);
+    }
+    // A key type the DuckDB temp-table ingest cannot represent falls back to
+    // the full fetch (correct, just unreduced). Postgres ingests via ADBC and
+    // has no such restriction.
+    if kind == DsKind::DuckDb && !connectors::duck_can_ingest(&keys.schema) {
         return fetch_scan(datasource, scan, None);
     }
     if fetches_most_of_table(datasource, scan, inject_column, num_keys)? {
-        parallel_probe_scan(datasource, scan)
-    } else {
-        temp_table_probe(datasource, scan, keys, inject_column)
+        return unselective_probe_scan(kind, datasource, scan);
     }
+    temp_table_probe(datasource, scan, keys, inject_column)
+}
+
+/// The probe read when the dynamic filter would select most of the table:
+/// Postgres gets the ctid-partitioned parallel scan; DuckDB (columnar, no
+/// secondary indexes - a semi-join costs a full scan anyway) just reads whole.
+fn unselective_probe_scan(kind: DsKind, datasource: &str, scan: &ScanSpec) -> PyResult<Batches> {
+    if kind == DsKind::Postgres {
+        return parallel_probe_scan(datasource, scan);
+    }
+    fetch_scan(datasource, scan, None)
 }
 
 /// `inject_column IN (v1, v2, ...)` from the collected key values.

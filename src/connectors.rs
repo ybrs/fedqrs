@@ -552,14 +552,32 @@ pub fn fetch_temp_join(
     join_sql: &str,
 ) -> PyResult<(SchemaRef, Vec<RecordBatch>)> {
     let s = spec(name)?;
-    if s.kind != DsKind::Postgres {
-        return Err(PyRuntimeError::new_err("temp-join pushdown is Postgres-only"));
+    match s.kind {
+        DsKind::Postgres => {
+            fetch_temp_join_pg(name, &s, temp_table, keys_schema, keys_batches, join_sql)
+        }
+        DsKind::DuckDb => {
+            fetch_temp_join_duckdb(&s, temp_table, keys_schema, keys_batches, join_sql)
+        }
+        DsKind::Parquet => Err(PyRuntimeError::new_err(
+            "temp-join pushdown does not apply to in-process Parquet",
+        )),
     }
+}
+
+fn fetch_temp_join_pg(
+    name: &str,
+    s: &DsSpec,
+    temp_table: &str,
+    keys_schema: SchemaRef,
+    keys_batches: Vec<RecordBatch>,
+    join_sql: &str,
+) -> PyResult<(SchemaRef, Vec<RecordBatch>)> {
     let drop_sql = format!("DROP TABLE IF EXISTS \"{}\"", temp_table.replace('"', "\"\""));
     PG_CACHE.with(|cache| {
         let mut map = cache.borrow_mut();
         if !map.contains_key(name) {
-            map.insert(name.to_string(), open_pg(&s).map_err(PyRuntimeError::new_err)?);
+            map.insert(name.to_string(), open_pg(s).map_err(PyRuntimeError::new_err)?);
         }
         let pg = map.get_mut(name).unwrap();
 
@@ -573,11 +591,91 @@ pub fn fetch_temp_join(
     })
 }
 
+/// The DuckDB arm of the temp-table pushdown. DuckDB temp tables are
+/// connection-scoped, so the key ingest (Arrow appender) and the semi-join
+/// must share one freshly-opened connection.
+fn fetch_temp_join_duckdb(
+    s: &DsSpec,
+    temp_table: &str,
+    keys_schema: SchemaRef,
+    keys_batches: Vec<RecordBatch>,
+    join_sql: &str,
+) -> PyResult<(SchemaRef, Vec<RecordBatch>)> {
+    let conn = open_duckdb(&s.uri).map_err(PyRuntimeError::new_err)?;
+    let key_field = keys_schema.field(0);
+    let duck_type = duck_type_name(key_field.data_type()).map_err(PyRuntimeError::new_err)?;
+    let create = format!(
+        "CREATE TEMP TABLE \"{}\" (\"{}\" {})",
+        temp_table.replace('"', "\"\""),
+        key_field.name().replace('"', "\"\""),
+        duck_type
+    );
+    conn.execute_batch(&create)
+        .map_err(|e| PyRuntimeError::new_err(format!("duckdb temp table: {e}")))?;
+    {
+        let mut appender = conn
+            .appender(temp_table)
+            .map_err(|e| PyRuntimeError::new_err(format!("duckdb appender: {e}")))?;
+        for batch in keys_batches {
+            appender
+                .append_record_batch(batch)
+                .map_err(|e| PyRuntimeError::new_err(format!("duckdb key ingest: {e}")))?;
+        }
+    }
+    let mut stmt = conn
+        .prepare(join_sql)
+        .map_err(|e| PyRuntimeError::new_err(format!("duckdb prepare: {e}")))?;
+    let arrow = stmt
+        .query_arrow([])
+        .map_err(|e| PyRuntimeError::new_err(format!("duckdb temp-join: {e}")))?;
+    let schema = arrow.get_schema();
+    let mut batches = Vec::new();
+    for batch in arrow {
+        batches.push(batch);
+    }
+    Ok((schema, batches))
+}
+
+/// Whether the DuckDB temp-table ingest can represent this key column type.
+pub fn duck_can_ingest(keys_schema: &SchemaRef) -> bool {
+    duck_type_name(keys_schema.field(0).data_type()).is_ok()
+}
+
+/// The DuckDB column type for one Arrow key type; an error for a type the
+/// ingest does not map (callers fall back to the full, unreduced fetch -
+/// correct, just without the transfer saving).
+fn duck_type_name(data_type: &DataType) -> Result<String, String> {
+    let name = match data_type {
+        DataType::Boolean => "BOOLEAN".to_string(),
+        DataType::Int8 => "TINYINT".to_string(),
+        DataType::Int16 => "SMALLINT".to_string(),
+        DataType::Int32 => "INTEGER".to_string(),
+        DataType::Int64 => "BIGINT".to_string(),
+        DataType::UInt8 => "UTINYINT".to_string(),
+        DataType::UInt16 => "USMALLINT".to_string(),
+        DataType::UInt32 => "UINTEGER".to_string(),
+        DataType::UInt64 => "UBIGINT".to_string(),
+        DataType::Float32 => "FLOAT".to_string(),
+        DataType::Float64 => "DOUBLE".to_string(),
+        DataType::Utf8 | DataType::LargeUtf8 => "VARCHAR".to_string(),
+        DataType::Date32 | DataType::Date64 => "DATE".to_string(),
+        DataType::Timestamp(_, _) => "TIMESTAMP".to_string(),
+        DataType::Decimal128(precision, scale) => format!("DECIMAL({precision},{scale})"),
+        other => return Err(format!("no DuckDB ingest type for Arrow {other}")),
+    };
+    Ok(name)
+}
+
 /// Estimate the fraction of the probe table a dynamic filter of `num_keys`
-/// distinct values would select, from `pg_class.reltuples` and the column's
-/// `pg_stats.n_distinct`. Returns None when statistics are unavailable (caller
-/// should then prefer the safe temp-table path). Used to choose between the
-/// temp-table pushdown and a full parallel scan.
+/// distinct values would select. Returns None when statistics are unavailable
+/// (caller should then prefer the safe temp-table path). Used to choose
+/// between the temp-table pushdown and a full scan.
+///
+/// Postgres: `pg_class.reltuples` and the column's `pg_stats.n_distinct`.
+/// DuckDB: `num_keys / duckdb_tables().estimated_size` - a catalog read, no
+/// scan. That equals the true selectivity for key columns (ndv = rows) and
+/// UNDERestimates it for low-NDV columns, biasing toward the temp-table path;
+/// bounded on DuckDB, where a semi-join costs a full vectorized scan anyway.
 pub fn estimate_selectivity(
     name: &str,
     schema: Option<&str>,
@@ -585,6 +683,9 @@ pub fn estimate_selectivity(
     column: &str,
     num_keys: usize,
 ) -> PyResult<Option<f64>> {
+    if kind(name)? == DsKind::DuckDb {
+        return estimate_selectivity_duckdb(name, schema, table, num_keys);
+    }
     let pred = match schema {
         Some(s) => format!("c.relname='{}' AND n.nspname='{}'", esc(table), esc(s)),
         None => format!("c.relname='{}'", esc(table)),
@@ -600,6 +701,42 @@ pub fn estimate_selectivity(
     );
     let (_, batches) = fetch(name, &sql)?;
     Ok(selectivity_from_stats(&batches, num_keys))
+}
+
+/// The DuckDB selectivity upper bound: keys / catalog row count.
+fn estimate_selectivity_duckdb(
+    name: &str,
+    schema: Option<&str>,
+    table: &str,
+    num_keys: usize,
+) -> PyResult<Option<f64>> {
+    let pred = match schema {
+        Some(s) => format!("table_name='{}' AND schema_name='{}'", esc(table), esc(s)),
+        None => format!("table_name='{}'", esc(table)),
+    };
+    let sql = format!(
+        "SELECT estimated_size::DOUBLE FROM duckdb_tables() WHERE {pred}"
+    );
+    let (_, batches) = fetch(name, &sql)?;
+    Ok(duck_fraction(&batches, num_keys))
+}
+
+/// num_keys over the catalog row count, when the catalog knows the table.
+fn duck_fraction(batches: &[RecordBatch], num_keys: usize) -> Option<f64> {
+    for batch in batches {
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let rows = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Float64Array>()?;
+        if rows.is_null(0) || rows.value(0) <= 0.0 {
+            return None;
+        }
+        return Some(num_keys as f64 / rows.value(0));
+    }
+    None
 }
 
 /// Parse the `register_datasource` params dict into a spec.
@@ -630,5 +767,76 @@ pub fn spec_from_params(kind: &str, params: &Bound<'_, PyAny>) -> PyResult<DsSpe
         other => Err(PyValueError::new_err(format!(
             "unknown datasource kind '{other}'"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{Float64Array, Int64Array};
+    use std::sync::Arc;
+
+    #[test]
+    fn duck_type_names_cover_the_join_key_types() {
+        assert_eq!(duck_type_name(&DataType::Int32).unwrap(), "INTEGER");
+        assert_eq!(duck_type_name(&DataType::Int64).unwrap(), "BIGINT");
+        assert_eq!(duck_type_name(&DataType::Utf8).unwrap(), "VARCHAR");
+        assert_eq!(duck_type_name(&DataType::Date32).unwrap(), "DATE");
+        assert_eq!(
+            duck_type_name(&DataType::Decimal128(12, 2)).unwrap(),
+            "DECIMAL(12,2)"
+        );
+        assert!(duck_type_name(&DataType::Binary).is_err());
+    }
+
+    #[test]
+    fn duck_fraction_is_keys_over_rows() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "estimated_size",
+            DataType::Float64,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Float64Array::from(vec![Some(1000.0)])) as ArrayRef],
+        )
+        .unwrap();
+        assert_eq!(duck_fraction(&[batch], 250), Some(0.25));
+    }
+
+    #[test]
+    fn duck_fraction_none_without_catalog_row() {
+        assert_eq!(duck_fraction(&[], 250), None);
+    }
+
+    #[test]
+    fn duck_temp_join_roundtrip_in_memory() {
+        // End-to-end on an in-memory database: create the probe, ingest keys
+        // through the temp-table arm's own steps, and semi-join.
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE probe (k BIGINT, v VARCHAR);
+             INSERT INTO probe SELECT g, 'v' || g FROM range(0, 100) t(g);
+             CREATE TEMP TABLE fedq_dyn_keys (k BIGINT);",
+        )
+        .unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, true)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int64Array::from(vec![1_i64, 3, 5])) as ArrayRef],
+        )
+        .unwrap();
+        {
+            let mut appender = conn.appender("fedq_dyn_keys").unwrap();
+            appender.append_record_batch(batch).unwrap();
+        }
+        let count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM probe WHERE k IN (SELECT k FROM fedq_dyn_keys)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 3);
     }
 }
