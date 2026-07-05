@@ -173,7 +173,11 @@ fn run_injected_scan(
     if kind == DsKind::DuckDb && !connectors::duck_can_ingest(&keys.schema) {
         return fetch_scan(datasource, scan, None);
     }
-    if fetches_most_of_table(datasource, scan, inject_column, num_keys)? {
+    // A raw-SQL probe (a pushed remote subtree) has no catalog identity for
+    // the selectivity guard; prefer the safe temp-table path directly.
+    if scan.table.is_some()
+        && fetches_most_of_table(datasource, scan, inject_column, num_keys)?
+    {
         return unselective_probe_scan(kind, datasource, scan);
     }
     temp_table_probe(datasource, scan, keys, inject_column)

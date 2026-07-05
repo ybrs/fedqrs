@@ -60,15 +60,14 @@ pub fn scan_sql(
     scan: &ScanSpec,
     extra_filter: Option<Expr>,
 ) -> Result<String, DataFusionError> {
-    // Pre-rendered SQL (a complex single-source subtree). No dynamic filter can
-    // be spliced into opaque SQL, so an injected scan must be structured.
+    // Pre-rendered SQL (a complex single-source subtree). A dynamic filter is
+    // applied by wrapping the opaque SQL as a derived table and filtering its
+    // OUTPUT columns - which is exactly what the injected column names.
     if let Some(raw) = &scan.raw_sql {
-        if extra_filter.is_some() {
-            return Err(DataFusionError::Plan(
-                "cannot inject a dynamic filter into a raw_sql scan".into(),
-            ));
-        }
-        return Ok(raw.clone());
+        return match extra_filter {
+            None => Ok(raw.clone()),
+            Some(filter) => wrapped_raw_sql(kind, raw, &filter),
+        };
     }
 
     let table = scan.table.as_ref().ok_or_else(|| {
@@ -110,6 +109,17 @@ pub fn scan_sql(
     Ok(sql)
 }
 
+/// A pre-rendered subtree filtered on its output columns:
+/// `SELECT * FROM (<raw>) AS "fedq_probe" WHERE <filter>`.
+fn wrapped_raw_sql(kind: DsKind, raw: &str, filter: &Expr) -> Result<String, DataFusionError> {
+    let dialect = dialect_for(kind);
+    let unparser = Unparser::new(dialect.as_ref());
+    let rendered = unparser.expr_to_sql(filter)?;
+    Ok(format!(
+        "SELECT * FROM ({raw}) AS \"fedq_probe\" WHERE {rendered}"
+    ))
+}
+
 /// Render the scan's static filter to SQL (for the parallel-scan strategy,
 /// which applies the base predicate but not the dynamic key filter).
 pub fn base_filter_sql(kind: DsKind, scan: &ScanSpec) -> Result<Option<String>, DataFusionError> {
@@ -134,6 +144,19 @@ pub fn temp_join_sql(
     key_col: &str,
     inject_col: &str,
 ) -> Result<String, DataFusionError> {
+    let membership = format!(
+        "{} IN (SELECT {} FROM {})",
+        quote_ident(inject_col),
+        quote_ident(key_col),
+        quote_ident(temp_table)
+    );
+    // A pre-rendered subtree probe: wrap it and apply the membership test to
+    // its output columns (a raw spec carries its own filters inside).
+    if let Some(raw) = &scan.raw_sql {
+        return Ok(format!(
+            "SELECT * FROM ({raw}) AS \"fedq_probe\" WHERE {membership}"
+        ));
+    }
     let table = scan
         .table
         .as_ref()
@@ -147,12 +170,6 @@ pub fn temp_join_sql(
     sql.push_str(" FROM ");
     sql.push_str(&table_ref(scan, table));
 
-    let membership = format!(
-        "{} IN (SELECT {} FROM {})",
-        quote_ident(inject_col),
-        quote_ident(key_col),
-        quote_ident(temp_table)
-    );
     let mut clauses = Vec::new();
     if let Some(f) = &scan.filter {
         clauses.push(render_filter(kind, f)?);
@@ -193,11 +210,24 @@ mod tests {
     }
 
     #[test]
-    fn raw_sql_passes_through_and_refuses_injection() {
-        let s = scan(r#"{"raw_sql":"SELECT 1"}"#);
-        assert_eq!(scan_sql(DsKind::Postgres, &s, None).unwrap(), "SELECT 1");
-        // a dynamic filter cannot be spliced into opaque SQL
-        assert!(scan_sql(DsKind::Postgres, &s, Some(datafusion::prelude::lit(true))).is_err());
+    fn raw_sql_passes_through_and_wraps_for_injection() {
+        let s = scan(r#"{"raw_sql":"SELECT 1 AS x"}"#);
+        assert_eq!(scan_sql(DsKind::Postgres, &s, None).unwrap(), "SELECT 1 AS x");
+        // a dynamic filter wraps the opaque SQL and filters its outputs
+        let sql =
+            scan_sql(DsKind::Postgres, &s, Some(datafusion::prelude::lit(true))).unwrap();
+        assert!(sql.starts_with("SELECT * FROM (SELECT 1 AS x) AS \"fedq_probe\" WHERE"), "{sql}");
+    }
+
+    #[test]
+    fn temp_join_wraps_a_raw_sql_probe() {
+        let s = scan(r#"{"raw_sql":"SELECT l FROM t"}"#);
+        let sql = temp_join_sql(DsKind::DuckDb, &s, "keys_tmp", "k", "l").unwrap();
+        assert_eq!(
+            sql,
+            "SELECT * FROM (SELECT l FROM t) AS \"fedq_probe\" \
+             WHERE \"l\" IN (SELECT \"k\" FROM \"keys_tmp\")"
+        );
     }
 
     #[test]
