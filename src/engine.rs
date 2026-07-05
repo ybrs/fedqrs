@@ -34,6 +34,14 @@ use fedqrs_core::sql::{base_filter_sql, render_expr, scan_sql, select_list_sql, 
 /// the (bandwidth-bound) table wins. Partition count is tuned near the core count.
 const IN_CAP: usize = 2000;
 const FULL_SCAN_FRACTION: f64 = 0.40;
+/// DuckDB temp-join ceiling. DuckDB's guard is keys/table-rows (a catalog
+/// read; no per-column NDV without a scan), which UNDERESTIMATES selectivity
+/// when the keys are a near-superset of the probe column's values (e.g. every
+/// order matches some customer: 150k keys, 10% of rows, 100% selectivity -
+/// measured as a q18 regression). Beyond this many keys the reduction rarely
+/// pays and the ingest cost grows, so the probe reads whole instead. Postgres
+/// keeps its pg_stats n_distinct guard and is not capped.
+const DUCK_TEMP_CAP: usize = 50_000;
 const PARALLEL_PARTITIONS: usize = 8;
 const DYN_KEYS_TEMP_TABLE: &str = "fedq_dyn_keys";
 
@@ -167,10 +175,13 @@ fn run_injected_scan(
     if kind == DsKind::Parquet {
         return fetch_scan(datasource, scan, None);
     }
-    // A key type the DuckDB temp-table ingest cannot represent falls back to
-    // the full fetch (correct, just unreduced). Postgres ingests via ADBC and
-    // has no such restriction.
-    if kind == DsKind::DuckDb && !connectors::duck_can_ingest(&keys.schema) {
+    // A key type the DuckDB temp-table ingest cannot represent, or a key set
+    // beyond the DuckDB ceiling (see DUCK_TEMP_CAP), falls back to the full
+    // fetch (correct, just unreduced). Postgres ingests via ADBC with a real
+    // statistics guard and has neither restriction.
+    if kind == DsKind::DuckDb
+        && (num_keys > DUCK_TEMP_CAP || !connectors::duck_can_ingest(&keys.schema))
+    {
         return fetch_scan(datasource, scan, None);
     }
     // A raw-SQL probe (a pushed remote subtree) has no catalog identity for
