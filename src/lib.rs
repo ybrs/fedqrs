@@ -49,7 +49,7 @@ fn fetch_parallel_to_stream(
     schema: Option<String>,
 ) -> PyResult<ArrowStreamExport> {
     let (result_schema, batches) =
-        connectors::fetch_parallel(name, schema.as_deref(), table, select_list, partitions, None)?;
+        connectors::fetch_parallel(name, schema.as_deref(), table, None, select_list, partitions, None)?;
     Ok(stream_from_batches(result_schema, batches))
 }
 

@@ -487,6 +487,7 @@ pub fn fetch_parallel(
     name: &str,
     schema: Option<&str>,
     table: &str,
+    alias: Option<&str>,
     select_list: &str,
     partitions: usize,
     where_clause: Option<&str>,
@@ -496,7 +497,12 @@ pub fn fetch_parallel(
         return Err(PyRuntimeError::new_err("parallel fetch is Postgres-only"));
     }
     let pages = relpages(name, schema, table)?;
-    let table_ref = qualified_table(schema, table);
+    // Render the alias so a select-list or filter that qualifies columns by it
+    // resolves (the unqualified `ctid` still binds to the single table).
+    let table_ref = match alias {
+        Some(a) => format!("{} AS \"{}\"", qualified_table(schema, table), a.replace('"', "\"\"")),
+        None => qualified_table(schema, table),
+    };
     let extra = match where_clause {
         Some(w) => format!(" AND ({w})"),
         None => String::new(),
@@ -726,6 +732,53 @@ pub fn estimate_selectivity(
     );
     let (_, batches) = fetch(name, &sql)?;
     Ok(selectivity_from_stats(&batches, num_keys))
+}
+
+/// Whether a Postgres column has an index usable for an `col IN (...)` semi-join
+/// - a btree/hash index whose LEADING key is that column, so the planner can
+/// bitmap-index-scan the matches instead of sequentially scanning the table.
+/// Cached per (datasource, schema, table, column): the schema is stable for the
+/// session. Only meaningful for Postgres; the caller gates DuckDB on
+/// selectivity alone (its scanner ignores indexes).
+pub fn column_has_index(
+    name: &str,
+    schema: Option<&str>,
+    table: &str,
+    column: &str,
+) -> PyResult<bool> {
+    static CACHE: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = format!("{name}\u{1}{}\u{1}{table}\u{1}{column}", schema.unwrap_or(""));
+    if let Some(cached) = cache.lock().unwrap().get(&key) {
+        return Ok(*cached);
+    }
+    let indexed = pg_column_indexed(name, schema, table, column)?;
+    cache.lock().unwrap().insert(key, indexed);
+    Ok(indexed)
+}
+
+/// The catalog query behind `column_has_index`: an index on this table whose
+/// first key column (`pg_index.indkey[0]`, an attnum) is `column`.
+fn pg_column_indexed(
+    name: &str,
+    schema: Option<&str>,
+    table: &str,
+    column: &str,
+) -> PyResult<bool> {
+    let pred = match schema {
+        Some(s) => format!("c.relname='{}' AND n.nspname='{}'", esc(table), esc(s)),
+        None => format!("c.relname='{}'", esc(table)),
+    };
+    let sql = format!(
+        "SELECT 1 FROM pg_index i \
+         JOIN pg_class c ON c.oid=i.indrelid \
+         JOIN pg_namespace n ON n.oid=c.relnamespace \
+         JOIN pg_attribute a ON a.attrelid=c.oid AND a.attnum=i.indkey[0] \
+         WHERE {pred} AND a.attname='{}' LIMIT 1",
+        esc(column)
+    );
+    let (_, batches) = fetch(name, &sql)?;
+    Ok(batches.iter().any(|b| b.num_rows() > 0))
 }
 
 /// The DuckDB selectivity upper bound: keys / catalog row count.

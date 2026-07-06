@@ -263,6 +263,9 @@ fn run_injected_scan(
     if num_keys == 0 {
         return fetch_scan(datasource, scan, Some(lit(false)));
     }
+    // A small key set delivers as an inline `col IN (v1, ..)` - a bounded
+    // literal filter the source plans normally. (A raw-SQL / island probe with
+    // injected_sql skips this: its filter is already baked into the SQL.)
     if num_keys < IN_CAP && scan.injected_sql.is_none() {
         let filter = in_list_filter(keys, inject_column)?;
         return fetch_scan(datasource, scan, Some(filter));
@@ -273,14 +276,26 @@ fn run_injected_scan(
     if kind == DsKind::Parquet {
         return fetch_scan(datasource, scan, None);
     }
-    // A key type the DuckDB temp-table ingest cannot represent, or a key set
-    // beyond the DuckDB ceiling (see DUCK_TEMP_CAP), falls back to the full
-    // fetch (correct, just unreduced). Postgres ingests via ADBC with a real
-    // statistics guard and has neither restriction.
+    // DuckDB: beyond the ingest ceiling, or a key type its temp-table ingest
+    // cannot represent, the probe reads whole (correct, just unreduced).
+    // Postgres ingests via ADBC and is bounded by the selectivity guard below.
     if kind == DsKind::DuckDb
         && (num_keys > DUCK_TEMP_CAP || !connectors::duck_can_ingest(&keys.schema))
     {
         return fetch_scan(datasource, scan, None);
+    }
+    // Postgres evaluates a key semi-join with an index scan ONLY when the probe
+    // column is indexed; without an index it degrades to a full sequential scan
+    // even at low cardinality (a worse disaster than shipping the rows), so an
+    // unindexed Postgres probe reads whole and the coordinator join reduces.
+    // DuckDB is columnar - its scanner ignores indexes, a semi-join is a full
+    // vectorized scan regardless - so it is never gated on an index.
+    if kind == DsKind::Postgres
+        && scan.table.is_some()
+        && !connectors::column_has_index(
+            datasource, scan.schema.as_deref(), scan.table.as_deref().unwrap(), inject_column)?
+    {
+        return unselective_probe_scan(kind, datasource, scan);
     }
     // A raw-SQL probe (a pushed remote subtree) has no catalog identity for
     // the selectivity guard; prefer the safe temp-table path directly.
@@ -360,6 +375,7 @@ fn parallel_probe_scan(datasource: &str, scan: &ScanSpec) -> PyResult<Batches> {
         datasource,
         scan.schema.as_deref(),
         table,
+        scan.alias.as_deref(),
         &select,
         PARALLEL_PARTITIONS,
         where_clause.as_deref(),
