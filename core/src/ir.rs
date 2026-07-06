@@ -111,6 +111,12 @@ pub struct ScanSpec {
     /// LIMIT); the engine validates and refuses anything else loudly.
     #[serde(default)]
     pub parallel: bool,
+    /// For a raw-SQL probe of a key reduction: the island SQL prerendered by
+    /// the planner with the key filter already ON ITS OWNING BASE RELATION,
+    /// reading the keys from the `fedq_dyn_keys` temp table. Preferred over
+    /// wrapping the island output, which sources cannot push down through.
+    #[serde(default)]
+    pub injected_sql: Option<String>,
 }
 
 /// A single local relational operator. Tagged by `kind` in JSON.

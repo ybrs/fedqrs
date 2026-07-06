@@ -258,7 +258,7 @@ fn run_injected_scan(
     if num_keys == 0 {
         return fetch_scan(datasource, scan, Some(lit(false)));
     }
-    if num_keys < IN_CAP {
+    if num_keys < IN_CAP && scan.injected_sql.is_none() {
         let filter = in_list_filter(keys, inject_column)?;
         return fetch_scan(datasource, scan, Some(filter));
     }
@@ -363,7 +363,15 @@ fn temp_table_probe(
 ) -> PyResult<Batches> {
     let kind = connectors::kind(datasource)?;
     let key_col = keys.schema.field(0).name();
-    let sql = temp_join_sql(kind, scan, DYN_KEYS_TEMP_TABLE, key_col, inject_column).map_err(df_to_py)?;
+    // A planner-prerendered island with the key filter already placed on its
+    // owning base relation beats the generic derived-table wrapper: sources
+    // do not push a semi-join through the wrapper (q03 measured 3.1x). The
+    // SQL references the same temp table this path is about to fill.
+    let sql = match &scan.injected_sql {
+        Some(prerendered) => prerendered.clone(),
+        None => temp_join_sql(kind, scan, DYN_KEYS_TEMP_TABLE, key_col, inject_column)
+            .map_err(df_to_py)?,
+    };
     let (schema, batches) = connectors::fetch_temp_join(
         datasource,
         DYN_KEYS_TEMP_TABLE,
