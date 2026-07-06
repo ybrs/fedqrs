@@ -41,14 +41,15 @@ const FULL_SCAN_FRACTION: f64 = 0.40;
 /// the SF1 customer probe: 25% selectivity temp-join 75.6ms vs parallel full
 /// 43ms - the break-even sits near 15%.
 const PG_FULL_SCAN_FRACTION: f64 = 0.15;
-/// DuckDB temp-join ceiling. DuckDB's guard is keys/table-rows (a catalog
-/// read; no per-column NDV without a scan), which UNDERESTIMATES selectivity
-/// when the keys are a near-superset of the probe column's values (e.g. every
-/// order matches some customer: 150k keys, 10% of rows, 100% selectivity -
-/// measured as a q18 regression). Beyond this many keys the reduction rarely
-/// pays and the ingest cost grows, so the probe reads whole instead. Postgres
-/// keeps its pg_stats n_distinct guard and is not capped.
-const DUCK_TEMP_CAP: usize = 50_000;
+/// DuckDB key-ingest ceiling: the point past which appending the keys into the
+/// temp table and probing costs more than reading the probe whole, REGARDLESS
+/// of selectivity. It is no longer a selectivity proxy - the near-superset case
+/// that a small cap once guarded (150k keys covering most of the column - the
+/// q18 regression) is now caught by `fetches_most_of_table`, which prices the
+/// real keys/NDV from the planner's statistics. So this only bounds the ingest
+/// work; a selective 100k-key set (q09: 108k green-part keys, 5.4% of lineitem)
+/// now reduces instead of reading 60M rows whole.
+const DUCK_TEMP_CAP: usize = 2_000_000;
 const PARALLEL_PARTITIONS: usize = 8;
 const DYN_KEYS_TEMP_TABLE: &str = "fedq_dyn_keys";
 
