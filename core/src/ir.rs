@@ -66,6 +66,13 @@ pub enum Step {
         inject_column: String,
         keys_from: String,
         binding: String,
+        /// The probe column's source-catalog NDV, threaded from the planner's
+        /// statistics cache. The delivery-strategy guard estimates the
+        /// fetched fraction as keys/NDV; without it the source-side fallback
+        /// (keys/row-count on DuckDB) UNDERESTIMATES selectivity for
+        /// near-superset key sets.
+        #[serde(default)]
+        inject_column_ndv: Option<u64>,
     },
 
     /// Run a relational fragment over named inputs and bind its result. `inputs`

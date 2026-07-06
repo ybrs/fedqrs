@@ -147,9 +147,12 @@ pub fn execute(ir: &Ir) -> PyResult<ArrowStreamExport> {
                 bindings.insert(binding.clone(), Binding::Keys(keys));
             }
 
-            Step::InjectedScan { datasource, scan, inject_column, keys_from, binding } => {
+            Step::InjectedScan {
+                datasource, scan, inject_column, keys_from, binding, inject_column_ndv,
+            } => {
                 let keys = keys_binding(&bindings, keys_from)?;
-                let batches = run_injected_scan(datasource, scan, inject_column, keys)?;
+                let batches =
+                    run_injected_scan(datasource, scan, inject_column, keys, *inject_column_ndv)?;
                 bindings.insert(binding.clone(), Binding::Materialized(batches));
             }
 
@@ -252,6 +255,7 @@ fn run_injected_scan(
     scan: &ScanSpec,
     inject_column: &str,
     keys: &Batches,
+    inject_column_ndv: Option<u64>,
 ) -> PyResult<Batches> {
     let num_keys: usize = keys.batches.iter().map(|b| b.num_rows()).sum();
 
@@ -280,7 +284,7 @@ fn run_injected_scan(
     // A raw-SQL probe (a pushed remote subtree) has no catalog identity for
     // the selectivity guard; prefer the safe temp-table path directly.
     if scan.table.is_some()
-        && fetches_most_of_table(datasource, scan, inject_column, num_keys)?
+        && fetches_most_of_table(datasource, scan, inject_column, num_keys, inject_column_ndv)?
     {
         return unselective_probe_scan(kind, datasource, scan);
     }
@@ -319,6 +323,7 @@ fn fetches_most_of_table(
     scan: &ScanSpec,
     inject_column: &str,
     num_keys: usize,
+    inject_column_ndv: Option<u64>,
 ) -> PyResult<bool> {
     let table = scan
         .table
@@ -328,6 +333,13 @@ fn fetches_most_of_table(
         DsKind::Postgres => PG_FULL_SCAN_FRACTION,
         _ => FULL_SCAN_FRACTION,
     };
+    // The planner's probe-column NDV gives the real fraction (keys/NDV);
+    // the source-side estimate is the fallback for unstatted columns.
+    if let Some(ndv) = inject_column_ndv {
+        if ndv > 0 {
+            return Ok(num_keys as f64 / ndv as f64 > threshold);
+        }
+    }
     let fraction =
         connectors::estimate_selectivity(datasource, scan.schema.as_deref(), table, inject_column, num_keys)?;
     Ok(fraction.map(|f| f > threshold).unwrap_or(false))
