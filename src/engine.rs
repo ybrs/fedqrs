@@ -30,10 +30,17 @@ use fedqrs_core::sql::{base_filter_sql, render_expr, scan_sql, select_list_sql, 
 
 /// Dynamic-filter strategy thresholds. Under `IN_CAP` distinct keys we inline an
 /// IN list; above it we push a temp table unless the filter would select more
-/// than `FULL_SCAN_FRACTION` of the probe, in which case a parallel full scan of
-/// the (bandwidth-bound) table wins. Partition count is tuned near the core count.
+/// than the source's full-scan fraction, in which case a full scan of the
+/// (bandwidth-bound) table wins. Partition count is tuned near the core count.
 const IN_CAP: usize = 2000;
+/// DuckDB's full-scan alternative is one single-stream read.
 const FULL_SCAN_FRACTION: f64 = 0.40;
+/// Postgres' full-scan alternative is the 8-way ctid-parallel read, whose
+/// wire+decode runs ~3.6x a single stream, while the temp-table semi-join is
+/// pinned to ONE connection (temp tables are connection-scoped). Measured on
+/// the SF1 customer probe: 25% selectivity temp-join 75.6ms vs parallel full
+/// 43ms - the break-even sits near 15%.
+const PG_FULL_SCAN_FRACTION: f64 = 0.15;
 /// DuckDB temp-join ceiling. DuckDB's guard is keys/table-rows (a catalog
 /// read; no per-column NDV without a scan), which UNDERESTIMATES selectivity
 /// when the keys are a near-superset of the probe column's values (e.g. every
@@ -303,8 +310,9 @@ fn in_list_filter(keys: &Batches, inject_column: &str) -> PyResult<Expr> {
     Ok(Expr::InList(InList::new(Box::new(column), values, false)))
 }
 
-/// True when the dynamic filter is estimated to select more than
-/// `FULL_SCAN_FRACTION` of the probe (so a parallel full scan beats a semi-join).
+/// True when the dynamic filter is estimated to select more of the probe
+/// than the source's full-scan fraction (the point where the full read -
+/// ctid-parallel on Postgres, single-stream on DuckDB - beats a semi-join).
 /// Unknown statistics => false (prefer the safe temp-table path).
 fn fetches_most_of_table(
     datasource: &str,
@@ -316,9 +324,13 @@ fn fetches_most_of_table(
         .table
         .as_deref()
         .ok_or_else(|| PyRuntimeError::new_err("injected scan needs a structured table"))?;
+    let threshold = match connectors::kind(datasource)? {
+        DsKind::Postgres => PG_FULL_SCAN_FRACTION,
+        _ => FULL_SCAN_FRACTION,
+    };
     let fraction =
         connectors::estimate_selectivity(datasource, scan.schema.as_deref(), table, inject_column, num_keys)?;
-    Ok(fraction.map(|f| f > FULL_SCAN_FRACTION).unwrap_or(false))
+    Ok(fraction.map(|f| f > threshold).unwrap_or(false))
 }
 
 /// Parallel ctid-partitioned full scan of the probe (base predicate only); the
