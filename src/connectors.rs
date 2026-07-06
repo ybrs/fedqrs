@@ -169,11 +169,35 @@ fn open_duckdb(path: &str) -> Result<duckdb::Connection, String> {
     duckdb::Connection::open(path).map_err(|e| format!("duckdb open '{path}': {e}"))
 }
 
+// A per-fetch DuckDB cursor over ONE process-wide open database instance per
+// file path. `Connection::open` instantiates a whole DuckDB database (built-in
+// function and type registration) - measured at ~7-10ms regardless of file size
+// - so re-opening per fetch was the dominant per-fetch cost. We open each file's
+// instance once (cached here, never dropped, so it stays live for the process)
+// and hand out cheap cursors via `try_clone`: a `duckdb_connect` on the
+// already-open database, microseconds. Each fetch gets its own cursor, so
+// connection-scoped temp tables stay isolated and drop with the cursor. The base
+// keeps the same read-write open mode as before, so it shares configuration with
+// any other DuckDB handle on the file in this process. Mirrors the Postgres pool
+// (PG_CACHE) and the Parquet SessionContext cache.
+fn duck_cursor(path: &str) -> PyResult<duckdb::Connection> {
+    static CACHE: OnceLock<Mutex<HashMap<String, duckdb::Connection>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut map = cache.lock().unwrap();
+    if !map.contains_key(path) {
+        let base = open_duckdb(path).map_err(PyRuntimeError::new_err)?;
+        map.insert(path.to_string(), base);
+    }
+    map.get(path)
+        .unwrap()
+        .try_clone()
+        .map_err(|e| PyRuntimeError::new_err(format!("duckdb cursor '{path}': {e}")))
+}
+
 fn fetch_duckdb(s: &DsSpec, sql: &str) -> PyResult<(SchemaRef, Vec<RecordBatch>)> {
-    // Open the database file fresh for each fetch. A cached connection snapshots
-    // the catalog at open time, so it would miss tables created later in the
-    // same session; a DuckDB source is a real file, so re-opening is cheap.
-    let conn = open_duckdb(&s.uri).map_err(PyRuntimeError::new_err)?;
+    // A cursor on the process-wide cached instance (see `duck_cursor`): the
+    // ~7-10ms DuckDB instance creation is paid once per file, not once per fetch.
+    let conn = duck_cursor(&s.uri)?;
     let mut stmt = conn
         .prepare(sql)
         .map_err(|e| PyRuntimeError::new_err(format!("duckdb prepare: {e}")))?;
@@ -592,8 +616,9 @@ fn fetch_temp_join_pg(
 }
 
 /// The DuckDB arm of the temp-table pushdown. DuckDB temp tables are
-/// connection-scoped, so the key ingest (Arrow appender) and the semi-join
-/// must share one freshly-opened connection.
+/// connection-scoped, so the key ingest (Arrow appender) and the semi-join must
+/// share one connection: a single cursor on the process-wide cached instance
+/// (see `duck_cursor`). The temp table drops when this cursor drops.
 fn fetch_temp_join_duckdb(
     s: &DsSpec,
     temp_table: &str,
@@ -601,7 +626,7 @@ fn fetch_temp_join_duckdb(
     keys_batches: Vec<RecordBatch>,
     join_sql: &str,
 ) -> PyResult<(SchemaRef, Vec<RecordBatch>)> {
-    let conn = open_duckdb(&s.uri).map_err(PyRuntimeError::new_err)?;
+    let conn = duck_cursor(&s.uri)?;
     let key_field = keys_schema.field(0);
     let duck_type = duck_type_name(key_field.data_type()).map_err(PyRuntimeError::new_err)?;
     let create = format!(
