@@ -128,7 +128,7 @@ pub fn execute(ir: &Ir) -> PyResult<ArrowStreamExport> {
         let started = std::time::Instant::now();
         match step {
             Step::SourceScan { datasource, scan, binding, materialize: _ } => {
-                let batches = fetch_scan(datasource, scan, None)?;
+                let batches = fetch_source(datasource, scan)?;
                 bindings.insert(binding.clone(), Binding::Materialized(batches));
             }
 
@@ -166,6 +166,33 @@ pub fn execute(ir: &Ir) -> PyResult<ArrowStreamExport> {
     }
 
     Err(PyRuntimeError::new_err("IR had no `return` step"))
+}
+
+/// A plain source read. A spec the planner marked `parallel` goes through the
+/// ctid-partitioned parallel Postgres path (each partition on its own pooled
+/// connection; NOTE: separate connections read separate snapshots, the same
+/// trade-off the parallel probe scan already makes - a shared exported
+/// snapshot is the follow-up for concurrent-write sources). Everything else
+/// is a single-stream fetch.
+fn fetch_source(datasource: &str, scan: &ScanSpec) -> PyResult<Batches> {
+    if !scan.parallel {
+        return fetch_scan(datasource, scan, None);
+    }
+    require_parallelizable(datasource, scan)?;
+    parallel_probe_scan(datasource, scan)
+}
+
+/// A `parallel` spec must be a plain structured Postgres table read; anything
+/// else is a planner contract violation and refuses loudly rather than
+/// guessing (a per-partition DISTINCT or LIMIT would return wrong rows).
+fn require_parallelizable(datasource: &str, scan: &ScanSpec) -> PyResult<()> {
+    let postgres = connectors::kind(datasource)? == DsKind::Postgres;
+    if postgres && scan.table.is_some() && !scan.distinct && scan.limit.is_none() {
+        return Ok(());
+    }
+    Err(PyRuntimeError::new_err(
+        "parallel scan spec is not a plain Postgres table read",
+    ))
 }
 
 /// Render a scan to SQL and fetch it natively.

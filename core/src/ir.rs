@@ -106,6 +106,11 @@ pub struct ScanSpec {
     pub limit: Option<usize>,
     #[serde(default)]
     pub distinct: bool,
+    /// Read this scan with the ctid-partitioned parallel Postgres path. Set by
+    /// the planner only for big plain table reads (structured, no DISTINCT, no
+    /// LIMIT); the engine validates and refuses anything else loudly.
+    #[serde(default)]
+    pub parallel: bool,
 }
 
 /// A single local relational operator. Tagged by `kind` in JSON.
