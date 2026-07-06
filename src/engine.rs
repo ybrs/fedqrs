@@ -63,6 +63,61 @@ fn df_to_py(e: DataFusionError) -> PyErr {
     PyRuntimeError::new_err(format!("{e}"))
 }
 
+/// Whether per-step timing lines go to stderr (FEDQRS_PROFILE=1). Read once.
+fn profile_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("FEDQRS_PROFILE").map_or(false, |v| v != "0" && !v.is_empty()))
+}
+
+/// Total rows currently held by a binding (either variant), for profiling.
+fn binding_rows(bindings: &HashMap<String, Binding>, name: &str) -> usize {
+    match bindings.get(name) {
+        Some(Binding::Materialized(b)) | Some(Binding::Keys(b)) => {
+            b.batches.iter().map(|x| x.num_rows()).sum()
+        }
+        None => 0,
+    }
+}
+
+/// The fragment's operator name, for profiling labels.
+fn fragment_kind(fragment: &Fragment) -> &'static str {
+    match fragment {
+        Fragment::HashJoin { .. } => "hash_join",
+        Fragment::NestedLoopJoin { .. } => "nested_loop_join",
+        Fragment::Project { .. } => "project",
+        Fragment::Aggregate { .. } => "aggregate",
+        Fragment::Sort { .. } => "sort",
+        Fragment::Filter { .. } => "filter",
+        Fragment::Limit { .. } => "limit",
+        Fragment::RawSql { .. } => "raw_sql",
+    }
+}
+
+/// One stderr line describing a finished step: time, output rows, what ran.
+fn log_step(step: &Step, ir: &Ir, bindings: &HashMap<String, Binding>, elapsed_ms: f64) {
+    let line = match step {
+        Step::SourceScan { datasource, scan, binding, .. } => {
+            let what = scan.raw_sql.as_deref().unwrap_or(scan.table.as_deref().unwrap_or("?"));
+            let short: String = what.chars().take(100).collect();
+            format!("source_scan   ds={datasource:<6} rows={:<9} {short}", binding_rows(bindings, binding))
+        }
+        Step::CollectDistinct { key, binding, .. } => {
+            format!("collect_dist  key={key:<20} rows={}", binding_rows(bindings, binding))
+        }
+        Step::InjectedScan { datasource, scan, inject_column, binding, .. } => {
+            let what = scan.raw_sql.as_deref().unwrap_or(scan.table.as_deref().unwrap_or("?"));
+            let short: String = what.chars().take(80).collect();
+            format!("injected_scan ds={datasource:<6} rows={:<9} col={inject_column} {short}", binding_rows(bindings, binding))
+        }
+        Step::Merge { fragment, binding, .. } => {
+            let kind = ir.fragments.get(fragment).map_or("?", fragment_kind);
+            format!("merge         {kind:<16} rows={}", binding_rows(bindings, binding))
+        }
+        Step::Return { .. } => "return".to_string(),
+    };
+    eprintln!("[fedqrs] {elapsed_ms:9.2}ms  {line}");
+}
+
 /// Interpret `ir` and return the result stream ready for export to Python.
 pub fn execute(ir: &Ir) -> PyResult<ArrowStreamExport> {
     let runtime = Runtime::new()
@@ -70,6 +125,7 @@ pub fn execute(ir: &Ir) -> PyResult<ArrowStreamExport> {
     let mut bindings: HashMap<String, Binding> = HashMap::new();
 
     for step in &ir.steps {
+        let started = std::time::Instant::now();
         match step {
             Step::SourceScan { datasource, scan, binding, materialize: _ } => {
                 let batches = fetch_scan(datasource, scan, None)?;
@@ -103,6 +159,9 @@ pub fn execute(ir: &Ir) -> PyResult<ArrowStreamExport> {
             Step::Return { input } => {
                 return export(&mut bindings, input);
             }
+        }
+        if profile_enabled() {
+            log_step(step, ir, &bindings, started.elapsed().as_secs_f64() * 1000.0);
         }
     }
 
