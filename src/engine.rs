@@ -138,10 +138,15 @@ struct LazyRegion {
 /// is the reliable one - TPC-DS q78's join inputs all estimate None).
 const REGION_SPILL_JOIN_INPUT_BYTES: usize = 8 * 1024 * 1024 * 1024;
 
-/// Materialized bindings larger than this spill to disk. Big enough that
-/// dimension tables and reduced probes stay in RAM; a fact-scale binding
-/// (SF10 store_sales is several GB) goes to disk and streams back.
-const BINDING_SPILL_BYTES: usize = 2 * 1024 * 1024 * 1024;
+/// Resident (in-memory) bindings may collectively hold this much before the
+/// LARGEST ones spill to disk. A per-binding threshold taxed every big-fact
+/// query with disk I/O the box never needed (q05 went 3.8s -> 15.4s at SF10
+/// re-reading a spilled store_sales that would have fit in RAM); what
+/// actually kills a run is the SUM of resident bindings, so the budget
+/// bounds the sum. 16GiB keeps typical multi-fact pipelines resident while
+/// a q64-scale pile still spills, and leaves the 32GiB operator pool and
+/// the harness RSS watchdog their headroom.
+const RESIDENT_BINDINGS_BUDGET: usize = 16 * 1024 * 1024 * 1024;
 
 /// Total Arrow buffer bytes held by a materialized relation.
 fn batches_bytes(b: &Batches) -> usize {
@@ -172,20 +177,52 @@ fn spill_binding(b: &Batches) -> Result<SpilledBinding, DataFusionError> {
     })
 }
 
-/// Store a materialized relation as a binding, spilling it past the size
-/// threshold so fact-scale intermediates and source reads do not stay
-/// RAM-resident between steps.
+/// Store a materialized relation as a binding, keeping the SUM of resident
+/// bindings under the budget: existing bindings spill largest-first to make
+/// room, and a relation bigger than the whole budget can only live on disk.
 fn store_relation(
     bindings: &mut HashMap<String, Binding>,
     name: &str,
     batches: Batches,
 ) -> Result<(), DataFusionError> {
-    if batches_bytes(&batches) > BINDING_SPILL_BYTES {
+    let incoming = batches_bytes(&batches);
+    spill_for_headroom(bindings, incoming)?;
+    if incoming > RESIDENT_BINDINGS_BUDGET {
         let spilled = spill_binding(&batches)?;
         bindings.insert(name.to_string(), Binding::Spilled(spilled));
         return Ok(());
     }
     bindings.insert(name.to_string(), Binding::Materialized(batches));
+    Ok(())
+}
+
+/// Spill the LARGEST resident bindings until `incoming` fits in the budget.
+/// Spilled bindings stay fully readable (every consumer streams the file),
+/// so evicting an already-stored relation is always safe.
+fn spill_for_headroom(
+    bindings: &mut HashMap<String, Binding>,
+    incoming: usize,
+) -> Result<(), DataFusionError> {
+    let mut sized: Vec<(String, usize)> = Vec::new();
+    for (name, binding) in bindings.iter() {
+        if let Binding::Materialized(b) = binding {
+            sized.push((name.clone(), batches_bytes(b)));
+        }
+    }
+    let mut resident: usize = sized.iter().map(|(_, bytes)| *bytes).sum();
+    sized.sort_by(|a, b| b.1.cmp(&a.1));
+    for (name, bytes) in sized {
+        if resident.saturating_add(incoming) <= RESIDENT_BINDINGS_BUDGET {
+            break;
+        }
+        let taken = match bindings.remove(&name) {
+            Some(Binding::Materialized(b)) => b,
+            _ => unreachable!("sized only holds materialized bindings"),
+        };
+        let spilled = spill_binding(&taken)?;
+        bindings.insert(name, Binding::Spilled(spilled));
+        resident = resident.saturating_sub(bytes);
+    }
     Ok(())
 }
 
