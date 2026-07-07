@@ -474,9 +474,7 @@ async fn run_limit(
     offset: usize,
 ) -> Result<Batches, DataFusionError> {
     let limited = ctx.table("in_0").await?.limit(offset, limit)?;
-    let schema = Arc::new(limited.schema().as_arrow().clone());
-    let batches = limited.collect().await?;
-    Ok(Batches { schema, batches })
+    collect_batches(limited).await
 }
 
 /// Filter the single input `in_0` by a boolean predicate.
@@ -485,9 +483,7 @@ async fn run_filter(
     predicate: &fedqrs_core::ir::IrExpr,
 ) -> Result<Batches, DataFusionError> {
     let filtered = ctx.table("in_0").await?.filter(to_df_expr(predicate)?)?;
-    let schema = Arc::new(filtered.schema().as_arrow().clone());
-    let batches = filtered.collect().await?;
-    Ok(Batches { schema, batches })
+    collect_batches(filtered).await
 }
 
 /// Order the single input `in_0` by the given keys.
@@ -500,9 +496,7 @@ async fn run_sort(
         sort_exprs.push(to_df_expr(&k.expr)?.sort(k.ascending, k.nulls_first));
     }
     let sorted = ctx.table("in_0").await?.sort(sort_exprs)?;
-    let schema = Arc::new(sorted.schema().as_arrow().clone());
-    let batches = sorted.collect().await?;
-    Ok(Batches { schema, batches })
+    collect_batches(sorted).await
 }
 
 /// Run a GROUP BY over the single input `in_0` by building DataFusion SQL, so
@@ -534,22 +528,40 @@ async fn run_aggregate(
     collect_batches(df).await
 }
 
-/// Collect a DataFrame into Batches carrying the PHYSICAL schema of the executed
-/// data. DataFusion's logical `df.schema()` can disagree with the collected
-/// batch schema - notably the decimal precision SUM widens (Decimal(17,2) ->
-/// Decimal(27,2)) - and a Binding must carry the schema its batches actually
-/// have, or registering it as a MemTable rejects it ("Mismatch between schema
-/// and batches"; q16/q94/q95). Falls back to the logical schema when empty.
+/// Collect a DataFrame into Batches under ONE schema all batches conform to.
+///
+/// The Binding's schema must match its batches or registering it as a MemTable
+/// rejects it ("Mismatch between schema and batches"). Two ways the logical
+/// `df.schema()` and the executed batches disagree:
+/// - TYPE: SUM widens decimal precision in execution (Decimal(17,2) ->
+///   Decimal(27,2)) but not in the logical schema (q16/q94/q95).
+/// - NULLABILITY: a UNION's branches can disagree on a column's nullability, so
+///   the collected batches disagree with EACH OTHER (q77).
+/// So take the executed types from the first batch, widen every field to
+/// nullable (the safe superset), and re-schema every batch to it. Falls back to
+/// the logical schema when empty.
 async fn collect_batches(
     df: datafusion::dataframe::DataFrame,
 ) -> Result<Batches, DataFusionError> {
     let logical = Arc::new(df.schema().as_arrow().clone());
     let batches = df.collect().await?;
     let schema = match batches.first() {
-        Some(batch) => batch.schema(),
+        Some(batch) => nullable_schema(&batch.schema()),
         None => logical,
     };
+    let batches = reschema(batches, &schema)?;
     Ok(Batches { schema, batches })
+}
+
+/// A copy of `schema` with every field marked nullable, keeping each field's
+/// executed data type. Lets batches that differ only on per-column nullability
+/// (a UNION branch whose column is non-null vs one where it is) share one schema.
+fn nullable_schema(schema: &Schema) -> SchemaRef {
+    let mut fields = Vec::with_capacity(schema.fields().len());
+    for field in schema.fields() {
+        fields.push(Field::new(field.name(), field.data_type().clone(), true));
+    }
+    Arc::new(Schema::new(fields))
 }
 
 /// The GROUP BY clause: `GROUPING SETS (...)` when sets are given, else a plain
