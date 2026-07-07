@@ -102,7 +102,7 @@ enum Binding {
     /// DataFusion execution at the next pipeline breaker (a key collection,
     /// a multi-consumer, the return) instead of draining per step - which is
     /// what let SF10 intermediates blow the memory pool.
-    Lazy(LogicalPlan),
+    Lazy(LazyRegion),
     /// A relation whose batches live in an Arrow IPC file on disk. A
     /// materialized binding past BINDING_SPILL_BYTES lands here instead of
     /// staying RAM-resident (memory the pool never accounts - the q64 RSS
@@ -118,7 +118,25 @@ struct SpilledBinding {
     schema: SchemaRef,
     file: RefCountedTempFile,
     rows: usize,
+    /// In-memory Arrow size before spilling, so a consuming region can
+    /// still price its total input volume.
+    bytes: usize,
 }
+
+/// A composed-but-unexecuted region: the fused plan plus the MEASURED total
+/// bytes of the relations feeding it (transitively through lazy inputs).
+struct LazyRegion {
+    plan: LogicalPlan,
+    input_bytes: usize,
+}
+
+/// A region fed by more input data than this executes with SPILLABLE
+/// sort-merge joins from the start: its hash-join builds (the one operator
+/// with no spill path) would exhaust the pool anyway, and predicting from
+/// MEASURED input bytes avoids paying a doomed first attempt (planner row
+/// estimates are absent on aggregate intermediates, so this runtime signal
+/// is the reliable one - TPC-DS q78's join inputs all estimate None).
+const REGION_SPILL_JOIN_INPUT_BYTES: usize = 8 * 1024 * 1024 * 1024;
 
 /// Materialized bindings larger than this spill to disk. Big enough that
 /// dimension tables and reduced probes stay in RAM; a fact-scale binding
@@ -146,7 +164,12 @@ fn spill_binding(b: &Batches) -> Result<SpilledBinding, DataFusionError> {
         rows += batch.num_rows();
     }
     writer.finish()?;
-    Ok(SpilledBinding { schema: b.schema.clone(), file, rows })
+    Ok(SpilledBinding {
+        schema: b.schema.clone(),
+        file,
+        rows,
+        bytes: batches_bytes(b),
+    })
 }
 
 /// Store a materialized relation as a binding, spilling it past the size
@@ -669,43 +692,53 @@ async fn run_fragment(
     inputs: &BTreeMap<String, String>,
 ) -> Result<Binding, DataFusionError> {
     let ctx = memory_capped_context();
+    let mut input_bytes = 0usize;
     for (table_name, binding_name) in inputs {
-        register_input(&ctx, bindings, remaining, table_name, binding_name).await?;
+        input_bytes = input_bytes.saturating_add(
+            register_input(&ctx, bindings, remaining, table_name, binding_name).await?,
+        );
     }
 
     match fragment {
         Fragment::HashJoin { join_type, left_keys, right_keys, project } => {
             let joined = join_frame(&ctx, *join_type, left_keys, right_keys).await?;
-            projected_binding(joined, project, false).await
+            projected_binding(joined, project, false, input_bytes).await
         }
         Fragment::NestedLoopJoin { join_type, condition, project } => {
             let joined = nested_loop_frame(&ctx, *join_type, condition).await?;
-            projected_binding(joined, project, false).await
+            projected_binding(joined, project, false, input_bytes).await
         }
         Fragment::Project { project, distinct } => {
             let frame = ctx.table("in_0").await?;
-            projected_binding(frame, project, *distinct).await
+            projected_binding(frame, project, *distinct, input_bytes).await
         }
         Fragment::Aggregate { select, group_by, grouping_sets } => {
-            Ok(lazy(run_aggregate(&ctx, select, group_by, grouping_sets).await?))
+            let frame = run_aggregate(&ctx, select, group_by, grouping_sets).await?;
+            Ok(lazy(frame, input_bytes))
         }
-        Fragment::Sort { keys } => Ok(lazy(run_sort(&ctx, keys).await?)),
-        Fragment::Filter { predicate } => Ok(lazy(run_filter(&ctx, predicate).await?)),
+        Fragment::Sort { keys } => Ok(lazy(run_sort(&ctx, keys).await?, input_bytes)),
+        Fragment::Filter { predicate } => {
+            Ok(lazy(run_filter(&ctx, predicate).await?, input_bytes))
+        }
         Fragment::Limit { limit, offset } => {
-            Ok(lazy(run_limit(&ctx, *limit, *offset).await?))
+            Ok(lazy(run_limit(&ctx, *limit, *offset).await?, input_bytes))
         }
         Fragment::SingleRowGuard { keys } => {
             // The guard EXECUTES its cardinality probe over the whole input,
             // so its passthrough result is materialized, never lazy.
             Ok(Binding::Materialized(run_single_row_guard(&ctx, keys).await?))
         }
-        Fragment::RawSql { sql } => Ok(lazy(run_raw_sql(&ctx, sql).await?)),
+        Fragment::RawSql { sql } => Ok(lazy(run_raw_sql(&ctx, sql).await?, input_bytes)),
     }
 }
 
-/// Wrap a composed DataFrame as a lazy binding.
-fn lazy(frame: datafusion::dataframe::DataFrame) -> Binding {
-    Binding::Lazy(frame.into_unoptimized_plan())
+/// Wrap a composed DataFrame as a lazy binding carrying the MEASURED total
+/// bytes of the relations feeding its region.
+fn lazy(frame: datafusion::dataframe::DataFrame, input_bytes: usize) -> Binding {
+    Binding::Lazy(LazyRegion {
+        plan: frame.into_unoptimized_plan(),
+        input_bytes,
+    })
 }
 
 /// Register one merge input on the fragment's scratch context.
@@ -720,15 +753,16 @@ async fn register_input(
     remaining: &mut HashMap<String, usize>,
     table_name: &str,
     binding_name: &str,
-) -> Result<(), DataFusionError> {
+) -> Result<usize, DataFusionError> {
     let uses = remaining.get(binding_name).copied().unwrap_or(0);
     let single_use_lazy =
         uses <= 1 && matches!(bindings.get(binding_name), Some(Binding::Lazy(_)));
     if single_use_lazy {
         note_use(remaining, binding_name);
-        let plan = take_lazy(bindings, binding_name)?;
-        ctx.register_table(table_name, Arc::new(ViewTable::new(plan, None)))?;
-        return Ok(());
+        let region = take_lazy(bindings, binding_name)?;
+        let input_bytes = region.input_bytes;
+        ctx.register_table(table_name, Arc::new(ViewTable::new(region.plan, None)))?;
+        return Ok(input_bytes);
     }
     if let Some(Binding::Spilled(spilled)) = bindings.get(binding_name) {
         // A spilled relation streams back from its IPC file; the file is
@@ -736,12 +770,13 @@ async fn register_input(
         // last one drops the map entry (the provider keeps the temp file
         // alive until its execution finishes).
         let provider = spilled_provider(spilled)?;
+        let input_bytes = spilled.bytes;
         ctx.register_table(table_name, provider)?;
         note_use(remaining, binding_name);
         if uses <= 1 {
             bindings.remove(binding_name);
         }
-        return Ok(());
+        return Ok(input_bytes);
     }
     force_materialized(bindings, binding_name).await?;
     if matches!(bindings.get(binding_name), Some(Binding::Spilled(_))) {
@@ -751,10 +786,11 @@ async fn register_input(
             .await;
     }
     let b = consume_materialized(bindings, remaining, binding_name)?;
+    let input_bytes = batches_bytes(&b);
     let table = MemTable::try_new(b.schema.clone(), vec![b.batches.clone()])
         .map_err(|e| binding_schema_error(binding_name, &b, e))?;
     ctx.register_table(table_name, Arc::new(table))?;
-    Ok(())
+    Ok(input_bytes)
 }
 
 /// Execute a lazy binding's composed plan and replace it with materialized
@@ -775,10 +811,17 @@ async fn force_materialized(
     if !matches!(bindings.get(name), Some(Binding::Lazy(_))) {
         return Ok(());
     }
-    let plan = take_lazy(bindings, name)?;
-    let batches = match execute_region(plan.clone(), false).await {
+    let region = take_lazy(bindings, name)?;
+    if region.input_bytes > REGION_SPILL_JOIN_INPUT_BYTES {
+        // The measured input volume says the hash builds cannot fit; go
+        // straight to spillable sort-merge joins instead of paying a
+        // doomed first attempt.
+        let batches = execute_region(region.plan, true).await?;
+        return store_relation(bindings, name, batches);
+    }
+    let batches = match execute_region(region.plan.clone(), false).await {
         Err(error) if retry_with_spillable_joins(&error) => {
-            execute_region(plan, true).await?
+            execute_region(region.plan, true).await?
         }
         other => other?,
     };
@@ -816,9 +859,9 @@ fn retry_with_spillable_joins(error: &DataFusionError) -> bool {
 fn take_lazy(
     bindings: &mut HashMap<String, Binding>,
     name: &str,
-) -> Result<LogicalPlan, DataFusionError> {
+) -> Result<LazyRegion, DataFusionError> {
     match bindings.remove(name) {
-        Some(Binding::Lazy(plan)) => Ok(plan),
+        Some(Binding::Lazy(region)) => Ok(region),
         Some(other) => {
             bindings.insert(name.to_string(), other);
             Err(DataFusionError::Plan(format!("binding '{name}' is not lazy")))
@@ -1050,6 +1093,7 @@ async fn projected_binding(
     df: datafusion::dataframe::DataFrame,
     project: &[Projection],
     distinct: bool,
+    input_bytes: usize,
 ) -> Result<Binding, DataFusionError> {
     if !unique_aliases(project) {
         return Ok(Binding::Materialized(
@@ -1064,7 +1108,7 @@ async fn projected_binding(
     if distinct {
         projected = projected.distinct()?;
     }
-    Ok(lazy(projected))
+    Ok(lazy(projected, input_bytes))
 }
 
 /// Whether every projection output name is unique.
