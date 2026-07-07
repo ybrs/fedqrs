@@ -598,6 +598,13 @@ async fn register_input(
 /// batches. A fused region runs HERE, as one streaming DataFusion execution
 /// whose operators spill through the shared runtime while collect_tracked
 /// accounts the accumulated result. A no-op for non-lazy bindings.
+///
+/// When the first attempt exhausts the memory pool inside an OPERATOR (a
+/// hash-join build - the one operator with no spill path), the region
+/// retries once with sort-merge joins, whose buffered side and sorts both
+/// spill: slower, but it completes instead of erroring (TPC-DS q78 at SF10).
+/// An exhaustion in the RESULT accumulation itself (fedq_collect) is not
+/// retried - the accumulated output would be just as large either way.
 async fn force_materialized(
     bindings: &mut HashMap<String, Binding>,
     name: &str,
@@ -606,11 +613,41 @@ async fn force_materialized(
         return Ok(());
     }
     let plan = take_lazy(bindings, name)?;
-    let ctx = memory_capped_context();
-    let frame = ctx.execute_logical_plan(plan).await?;
-    let batches = collect_batches(frame).await?;
+    let batches = match execute_region(plan.clone(), false).await {
+        Err(error) if retry_with_spillable_joins(&error) => {
+            execute_region(plan, true).await?
+        }
+        other => other?,
+    };
     bindings.insert(name.to_string(), Binding::Materialized(batches));
     Ok(())
+}
+
+/// Run one composed region to completion. `spillable_joins` plans equi-joins
+/// as sort-merge (spilling) instead of hash (non-spilling).
+async fn execute_region(
+    plan: LogicalPlan,
+    spillable_joins: bool,
+) -> Result<Batches, DataFusionError> {
+    let mut config = SessionConfig::new();
+    if spillable_joins {
+        config = config.set_bool("datafusion.optimizer.prefer_hash_join", false);
+    }
+    let ctx = SessionContext::new_with_config_rt(config, runtime_env());
+    let frame = ctx.execute_logical_plan(plan).await?;
+    collect_batches(frame).await
+}
+
+/// Whether a region failure warrants the sort-merge retry: the pool was
+/// exhausted by an operator, not by our own result accumulation (whose
+/// reservation is named fedq_collect - re-running would accumulate the same
+/// rows and fail the same way). The exhaustion arrives WRAPPED (streams
+/// share errors via Context/Shared), so match on the root of the chain.
+fn retry_with_spillable_joins(error: &DataFusionError) -> bool {
+    match error.find_root() {
+        DataFusionError::ResourcesExhausted(message) => !message.contains("fedq_collect"),
+        _ => false,
+    }
 }
 
 /// Take a binding out of the map as a lazy plan.
