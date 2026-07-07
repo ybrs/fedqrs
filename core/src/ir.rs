@@ -149,8 +149,13 @@ pub enum Fragment {
         project: Vec<Projection>,
     },
     /// A projection over a single input (`in_0`): evaluate each expression and
-    /// alias it to the output column name.
-    Project { project: Vec<Projection> },
+    /// alias it to the output column name. `distinct` deduplicates the
+    /// projected rows (SELECT DISTINCT).
+    Project {
+        project: Vec<Projection>,
+        #[serde(default)]
+        distinct: bool,
+    },
     /// A GROUP BY (or grand-total) aggregation over a single input (`in_0`).
     /// `select` is the output list (aggregate calls and grouping expressions);
     /// `group_by` is the grouping key list.
@@ -174,6 +179,16 @@ pub enum Fragment {
         limit: Option<usize>,
         #[serde(default)]
         offset: usize,
+    },
+    /// The scalar-subquery cardinality guard over a single input (`in_0`).
+    /// With no keys the input may hold at most ONE row in total; with keys, at
+    /// most one row per distinct key tuple (the decorrelated per-outer-row
+    /// rule). A violation is an execution error - a scalar subquery must be
+    /// single-valued, so silently joining a multi-row side would duplicate
+    /// outer rows. Otherwise the input passes through unchanged.
+    SingleRowGuard {
+        #[serde(default)]
+        keys: Vec<IrExpr>,
     },
     /// Run a pre-rendered SQL statement over the merge inputs (registered under
     /// their names). The escape hatch for a whole WITH / CTE that Python already
@@ -338,6 +353,21 @@ mod tests {
         assert!(matches!(ir.steps[2], Step::InjectedScan { .. }));
         assert!(matches!(ir.steps[4], Step::Return { .. }));
         assert!(matches!(ir.fragments.get("f"), Some(Fragment::Aggregate { .. })));
+    }
+
+    #[test]
+    fn parses_single_row_guard_fragment() {
+        // Keyed form carries key expressions; the keyless form (empty or
+        // absent `keys`, via serde default) is the at-most-one-row-total guard.
+        let keyed: Fragment = serde_json::from_str(
+            r#"{"kind":"single_row_guard","keys":[
+                {"node":"column","relation":"in_0","name":"k0"}]}"#,
+        )
+        .unwrap();
+        assert!(matches!(keyed, Fragment::SingleRowGuard { ref keys } if keys.len() == 1));
+        let keyless: Fragment =
+            serde_json::from_str(r#"{"kind":"single_row_guard"}"#).unwrap();
+        assert!(matches!(keyless, Fragment::SingleRowGuard { ref keys } if keys.is_empty()));
     }
 
     #[test]

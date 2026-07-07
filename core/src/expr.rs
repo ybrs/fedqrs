@@ -165,6 +165,8 @@ fn operator(op: &str) -> Result<Operator, DataFusionError> {
         "or" => Operator::Or,
         "like" => Operator::LikeMatch,
         "ilike" => Operator::ILikeMatch,
+        "is_distinct_from" => Operator::IsDistinctFrom,
+        "is_not_distinct_from" => Operator::IsNotDistinctFrom,
         other => return plan_err(format!("unsupported binary operator '{other}'")),
     })
 }

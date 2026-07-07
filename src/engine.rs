@@ -123,6 +123,7 @@ fn fragment_kind(fragment: &Fragment) -> &'static str {
         Fragment::Sort { .. } => "sort",
         Fragment::Filter { .. } => "filter",
         Fragment::Limit { .. } => "limit",
+        Fragment::SingleRowGuard { .. } => "single_row_guard",
         Fragment::RawSql { .. } => "raw_sql",
     }
 }
@@ -479,15 +480,47 @@ async fn run_fragment(
         Fragment::NestedLoopJoin { join_type, condition, project } => {
             run_nested_loop_join(&ctx, *join_type, condition, project).await
         }
-        Fragment::Project { project } => run_project(&ctx, project).await,
+        Fragment::Project { project, distinct } => run_project(&ctx, project, *distinct).await,
         Fragment::Aggregate { select, group_by, grouping_sets } => {
             run_aggregate(&ctx, select, group_by, grouping_sets).await
         }
         Fragment::Sort { keys } => run_sort(&ctx, keys).await,
         Fragment::Filter { predicate } => run_filter(&ctx, predicate).await,
         Fragment::Limit { limit, offset } => run_limit(&ctx, *limit, *offset).await,
+        Fragment::SingleRowGuard { keys } => run_single_row_guard(&ctx, keys).await,
         Fragment::RawSql { sql } => run_raw_sql(&ctx, sql).await,
     }
+}
+
+/// The scalar-subquery cardinality guard: error when `in_0` holds more than
+/// one row (per distinct key tuple when keys are given, the decorrelated
+/// per-outer-row rule), otherwise pass the input through unchanged. The
+/// violation mirrors real engines' scalar-subquery error - returning the rows
+/// would let the join above silently duplicate outer rows.
+async fn run_single_row_guard(
+    ctx: &SessionContext,
+    keys: &[fedqrs_core::ir::IrExpr],
+) -> Result<Batches, DataFusionError> {
+    let mut rendered_keys = Vec::with_capacity(keys.len());
+    for key in keys {
+        rendered_keys.push(render_expr(&to_df_expr(key)?)?);
+    }
+    // Violation iff the probe returns any row: a lone HAVING is the grand-
+    // total count, GROUP BY + HAVING the per-key counts.
+    let probe_sql = match rendered_keys.is_empty() {
+        true => "SELECT 1 FROM \"in_0\" HAVING count(*) > 1".to_string(),
+        false => format!(
+            "SELECT 1 FROM \"in_0\" GROUP BY {} HAVING count(*) > 1 LIMIT 1",
+            rendered_keys.join(", ")
+        ),
+    };
+    let violations = ctx.sql(&probe_sql).await?.count().await?;
+    if violations > 0 {
+        return Err(DataFusionError::Execution(
+            "Scalar subquery produced more than one row".to_string(),
+        ));
+    }
+    collect_batches(ctx.table("in_0").await?).await
 }
 
 /// Run pre-rendered SQL over the registered merge inputs (e.g. a whole CTE).
@@ -677,8 +710,9 @@ fn quote_ident(name: &str) -> String {
 async fn run_project(
     ctx: &SessionContext,
     project: &[Projection],
+    distinct: bool,
 ) -> Result<Batches, DataFusionError> {
-    project_dataframe(ctx.table("in_0").await?, project).await
+    project_dataframe_dedup(ctx.table("in_0").await?, project, distinct).await
 }
 
 /// Project a DataFrame to its output columns. Each expression is aliased to a
@@ -689,13 +723,25 @@ async fn project_dataframe(
     df: datafusion::dataframe::DataFrame,
     project: &[Projection],
 ) -> Result<Batches, DataFusionError> {
+    project_dataframe_dedup(df, project, false).await
+}
+
+/// `project_dataframe` with an optional DISTINCT over the projected rows.
+async fn project_dataframe_dedup(
+    df: datafusion::dataframe::DataFrame,
+    project: &[Projection],
+    distinct: bool,
+) -> Result<Batches, DataFusionError> {
     let mut exprs = Vec::with_capacity(project.len());
     for (i, p) in project.iter().enumerate() {
         exprs.push(to_df_expr(&p.expr)?.alias(format!("__c{i}")));
     }
-    let projected = df.select(exprs)?;
+    let mut projected = df.select(exprs)?;
+    if distinct {
+        projected = projected.distinct()?;
+    }
     let internal = projected.schema().as_arrow().clone();
-    let batches = projected.collect().await?;
+    let batches = collect_tracked(projected).await?;
     let schema = output_schema(&internal, project);
     let batches = reschema(batches, &schema)?;
     Ok(Batches { schema, batches })
