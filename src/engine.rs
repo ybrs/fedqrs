@@ -161,6 +161,7 @@ pub fn execute(ir: &Ir) -> PyResult<(SchemaRef, Vec<RecordBatch>)> {
     let runtime = Runtime::new()
         .map_err(|e| PyRuntimeError::new_err(format!("tokio runtime: {e}")))?;
     let mut bindings: HashMap<String, Binding> = HashMap::new();
+    let mut remaining = binding_use_counts(ir);
 
     for step in &ir.steps {
         let started = std::time::Instant::now();
@@ -175,6 +176,7 @@ pub fn execute(ir: &Ir) -> PyResult<(SchemaRef, Vec<RecordBatch>)> {
                 let keys = runtime
                     .block_on(collect_distinct(src, key))
                     .map_err(df_to_py)?;
+                note_use(&mut remaining, input);
                 bindings.insert(binding.clone(), Binding::Keys(keys));
             }
 
@@ -184,6 +186,7 @@ pub fn execute(ir: &Ir) -> PyResult<(SchemaRef, Vec<RecordBatch>)> {
                 let keys = keys_binding(&bindings, keys_from)?;
                 let batches =
                     run_injected_scan(datasource, scan, inject_column, keys, *inject_column_ndv)?;
+                note_use(&mut remaining, keys_from);
                 bindings.insert(binding.clone(), Binding::Materialized(batches));
             }
 
@@ -192,7 +195,7 @@ pub fn execute(ir: &Ir) -> PyResult<(SchemaRef, Vec<RecordBatch>)> {
                     PyRuntimeError::new_err(format!("unknown fragment '{fragment}'"))
                 })?;
                 let result = runtime
-                    .block_on(run_fragment(&mut bindings, frag, inputs))
+                    .block_on(run_fragment(&mut bindings, &mut remaining, frag, inputs))
                     .map_err(df_to_py)?;
                 bindings.insert(binding.clone(), Binding::Materialized(result));
             }
@@ -207,6 +210,38 @@ pub fn execute(ir: &Ir) -> PyResult<(SchemaRef, Vec<RecordBatch>)> {
     }
 
     Err(PyRuntimeError::new_err("IR had no `return` step"))
+}
+
+/// How many times each binding is read across the whole plan (merge inputs,
+/// distinct-key collection, injected-scan keys, the final return). A shared
+/// binding - a multi-referenced CTE's materialized body - is CLONED
+/// (Arc-shallow) by every consumer except its last, which takes it, so
+/// memory is released exactly where single-use behavior released it.
+fn binding_use_counts(ir: &Ir) -> HashMap<String, usize> {
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    let mut bump = |name: &String| *counts.entry(name.clone()).or_insert(0) += 1;
+    for step in &ir.steps {
+        match step {
+            Step::SourceScan { .. } => {}
+            Step::CollectDistinct { input, .. } => bump(input),
+            Step::InjectedScan { keys_from, .. } => bump(keys_from),
+            Step::Merge { inputs, .. } => {
+                for name in inputs.values() {
+                    bump(name);
+                }
+            }
+            Step::Return { input } => bump(input),
+        }
+    }
+    counts
+}
+
+/// Record one non-consuming read of a binding, so a later consumer knows
+/// whether it is the last reader (and may take instead of clone).
+fn note_use(remaining: &mut HashMap<String, usize>, name: &str) {
+    if let Some(uses) = remaining.get_mut(name) {
+        *uses = uses.saturating_sub(1);
+    }
 }
 
 /// A plain source read. A spec the planner marked `parallel` goes through the
@@ -463,12 +498,13 @@ async fn collect_distinct(src: &Batches, key: &str) -> Result<Batches, DataFusio
 /// Register the fragment's inputs and run it on DataFusion.
 async fn run_fragment(
     bindings: &mut HashMap<String, Binding>,
+    remaining: &mut HashMap<String, usize>,
     fragment: &Fragment,
     inputs: &BTreeMap<String, String>,
 ) -> Result<Batches, DataFusionError> {
     let ctx = memory_capped_context();
     for (table_name, binding_name) in inputs {
-        let b = take_materialized(bindings, binding_name)?;
+        let b = consume_materialized(bindings, remaining, binding_name)?;
         let table = MemTable::try_new(b.schema, vec![b.batches])?;
         ctx.register_table(table_name.as_str(), Arc::new(table))?;
     }
@@ -815,7 +851,34 @@ fn datafusion_join_type(k: JoinKind) -> JoinType {
     }
 }
 
-/// Consume a binding as materialized batches.
+/// Consume a binding as materialized batches. The LAST reader takes it out
+/// of the map; earlier readers of a shared binding (a multi-referenced CTE's
+/// materialized body) get an Arc-shallow clone so the binding survives for
+/// the next reader.
+fn consume_materialized(
+    bindings: &mut HashMap<String, Binding>,
+    remaining: &mut HashMap<String, usize>,
+    name: &str,
+) -> Result<Batches, DataFusionError> {
+    let uses = remaining.get(name).copied().unwrap_or(0);
+    if uses > 1 {
+        note_use(remaining, name);
+        return match bindings.get(name) {
+            Some(Binding::Materialized(b)) => Ok(Batches {
+                schema: b.schema.clone(),
+                batches: b.batches.clone(),
+            }),
+            Some(_) => Err(DataFusionError::Plan(format!(
+                "binding '{name}' is not a relation"
+            ))),
+            None => Err(DataFusionError::Plan(format!("unknown binding '{name}'"))),
+        };
+    }
+    note_use(remaining, name);
+    take_materialized(bindings, name)
+}
+
+/// Take a binding out of the map as materialized batches.
 fn take_materialized(
     bindings: &mut HashMap<String, Binding>,
     name: &str,
