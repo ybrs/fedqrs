@@ -12,10 +12,14 @@ use std::sync::{Arc, OnceLock};
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::{Field, Schema, SchemaRef};
+use datafusion::catalog::streaming::StreamingTable;
 use datafusion::catalog::view::ViewTable;
 use datafusion::common::{Column, DataFusionError, JoinType, TableReference};
 use datafusion::datasource::MemTable;
+use datafusion::execution::disk_manager::RefCountedTempFile;
 use datafusion::logical_expr::LogicalPlan;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::physical_plan::streaming::PartitionStream;
 use datafusion::execution::memory_pool::{FairSpillPool, MemoryConsumer};
 use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
 use futures::StreamExt;
@@ -99,6 +103,118 @@ enum Binding {
     /// a multi-consumer, the return) instead of draining per step - which is
     /// what let SF10 intermediates blow the memory pool.
     Lazy(LogicalPlan),
+    /// A relation whose batches live in an Arrow IPC file on disk. A
+    /// materialized binding past BINDING_SPILL_BYTES lands here instead of
+    /// staying RAM-resident (memory the pool never accounts - the q64 RSS
+    /// kill at SF10); consumers read it back as a STREAM, batch at a time,
+    /// and the file is re-readable so multi-consumers need no copies.
+    Spilled(SpilledBinding),
+}
+
+/// The on-disk form of a spilled relation. The temp file is reference
+/// counted by DataFusion's DiskManager and deletes itself when the last
+/// clone (binding or in-flight stream) drops.
+struct SpilledBinding {
+    schema: SchemaRef,
+    file: RefCountedTempFile,
+    rows: usize,
+}
+
+/// Materialized bindings larger than this spill to disk. Big enough that
+/// dimension tables and reduced probes stay in RAM; a fact-scale binding
+/// (SF10 store_sales is several GB) goes to disk and streams back.
+const BINDING_SPILL_BYTES: usize = 2 * 1024 * 1024 * 1024;
+
+/// Total Arrow buffer bytes held by a materialized relation.
+fn batches_bytes(b: &Batches) -> usize {
+    let mut total = 0;
+    for batch in &b.batches {
+        total += batch.get_array_memory_size();
+    }
+    total
+}
+
+/// Write a relation to an Arrow IPC temp file via the DiskManager.
+fn spill_binding(b: &Batches) -> Result<SpilledBinding, DataFusionError> {
+    let file = runtime_env().disk_manager.create_tmp_file("fedq_binding")?;
+    let handle = std::fs::File::create(file.path())
+        .map_err(|e| DataFusionError::Execution(format!("binding spill create: {e}")))?;
+    let mut writer = arrow::ipc::writer::FileWriter::try_new(handle, &b.schema)?;
+    let mut rows = 0;
+    for batch in &b.batches {
+        writer.write(batch)?;
+        rows += batch.num_rows();
+    }
+    writer.finish()?;
+    Ok(SpilledBinding { schema: b.schema.clone(), file, rows })
+}
+
+/// Store a materialized relation as a binding, spilling it past the size
+/// threshold so fact-scale intermediates and source reads do not stay
+/// RAM-resident between steps.
+fn store_relation(
+    bindings: &mut HashMap<String, Binding>,
+    name: &str,
+    batches: Batches,
+) -> Result<(), DataFusionError> {
+    if batches_bytes(&batches) > BINDING_SPILL_BYTES {
+        let spilled = spill_binding(&batches)?;
+        bindings.insert(name.to_string(), Binding::Spilled(spilled));
+        return Ok(());
+    }
+    bindings.insert(name.to_string(), Binding::Materialized(batches));
+    Ok(())
+}
+
+/// One re-openable stream over a spilled relation's IPC file.
+#[derive(Debug)]
+struct SpillStream {
+    schema: SchemaRef,
+    file: RefCountedTempFile,
+}
+
+impl PartitionStream for SpillStream {
+    fn schema(&self) -> &SchemaRef {
+        &self.schema
+    }
+
+    fn execute(
+        &self,
+        _ctx: Arc<datafusion::execution::TaskContext>,
+    ) -> datafusion::physical_plan::SendableRecordBatchStream {
+        let schema = self.schema.clone();
+        let opened = std::fs::File::open(self.file.path())
+            .map_err(|e| DataFusionError::Execution(format!("binding spill open: {e}")))
+            .and_then(|handle| {
+                arrow::ipc::reader::FileReader::try_new(handle, None)
+                    .map_err(DataFusionError::from)
+            });
+        match opened {
+            Ok(reader) => {
+                let batches = reader.map(|item| item.map_err(DataFusionError::from));
+                Box::pin(RecordBatchStreamAdapter::new(
+                    schema,
+                    futures::stream::iter(batches),
+                ))
+            }
+            Err(error) => Box::pin(RecordBatchStreamAdapter::new(
+                schema,
+                futures::stream::iter(vec![Err(error)]),
+            )),
+        }
+    }
+}
+
+/// A streaming table provider over a spilled relation.
+fn spilled_provider(spilled: &SpilledBinding) -> Result<Arc<StreamingTable>, DataFusionError> {
+    let stream = SpillStream {
+        schema: spilled.schema.clone(),
+        file: spilled.file.clone(),
+    };
+    Ok(Arc::new(StreamingTable::try_new(
+        spilled.schema.clone(),
+        vec![Arc::new(stream)],
+    )?))
 }
 
 fn df_to_py(e: DataFusionError) -> PyErr {
@@ -119,6 +235,7 @@ fn binding_rows(bindings: &HashMap<String, Binding>, name: &str) -> usize {
         }
         // A lazy binding has no rows yet; the forcing step reports them.
         Some(Binding::Lazy(_)) => 0,
+        Some(Binding::Spilled(spilled)) => spilled.rows,
         None => 0,
     }
 }
@@ -178,16 +295,15 @@ pub fn execute(ir: &Ir) -> PyResult<(SchemaRef, Vec<RecordBatch>)> {
         match step {
             Step::SourceScan { datasource, scan, binding, materialize: _ } => {
                 let batches = fetch_source(datasource, scan)?;
-                bindings.insert(binding.clone(), Binding::Materialized(batches));
+                store_relation(&mut bindings, binding, batches).map_err(df_to_py)?;
             }
 
             Step::CollectDistinct { input, key, cap: _, binding } => {
                 runtime
                     .block_on(force_materialized(&mut bindings, input))
                     .map_err(df_to_py)?;
-                let src = materialized(&bindings, input)?;
                 let keys = runtime
-                    .block_on(collect_distinct(src, key))
+                    .block_on(collect_distinct_from(&bindings, input, key))
                     .map_err(df_to_py)?;
                 note_use(&mut remaining, input);
                 bindings.insert(binding.clone(), Binding::Keys(keys));
@@ -200,7 +316,7 @@ pub fn execute(ir: &Ir) -> PyResult<(SchemaRef, Vec<RecordBatch>)> {
                 let batches =
                     run_injected_scan(datasource, scan, inject_column, keys, *inject_column_ndv)?;
                 note_use(&mut remaining, keys_from);
-                bindings.insert(binding.clone(), Binding::Materialized(batches));
+                store_relation(&mut bindings, binding, batches).map_err(df_to_py)?;
             }
 
             Step::Merge { fragment, inputs, binding } => {
@@ -210,7 +326,17 @@ pub fn execute(ir: &Ir) -> PyResult<(SchemaRef, Vec<RecordBatch>)> {
                 let result = runtime
                     .block_on(run_fragment(&mut bindings, &mut remaining, frag, inputs))
                     .map_err(df_to_py)?;
-                bindings.insert(binding.clone(), result);
+                match result {
+                    // An eagerly materialized fragment result (the guard, a
+                    // duplicate-name projection) spills past the threshold
+                    // like any other relation.
+                    Binding::Materialized(batches) => {
+                        store_relation(&mut bindings, binding, batches).map_err(df_to_py)?
+                    }
+                    other => {
+                        bindings.insert(binding.clone(), other);
+                    }
+                }
             }
 
             Step::Return { input } => {
@@ -492,12 +618,30 @@ fn temp_table_probe(
     Ok(Batches { schema, batches })
 }
 
-/// DISTINCT of one key column, NULL-free (the full set; the strategy chosen in
-/// `run_injected_scan` decides how to apply it).
-async fn collect_distinct(src: &Batches, key: &str) -> Result<Batches, DataFusionError> {
+/// DISTINCT of one key column, NULL-free (the full set; the strategy chosen
+/// in `run_injected_scan` decides how to apply it). Reads a materialized
+/// relation from memory and a spilled one as a stream from its IPC file.
+async fn collect_distinct_from(
+    bindings: &HashMap<String, Binding>,
+    name: &str,
+    key: &str,
+) -> Result<Batches, DataFusionError> {
     let ctx = memory_capped_context();
-    let table = MemTable::try_new(src.schema.clone(), vec![src.batches.clone()])?;
-    ctx.register_table("build", Arc::new(table))?;
+    match bindings.get(name) {
+        Some(Binding::Materialized(src)) => {
+            let table = MemTable::try_new(src.schema.clone(), vec![src.batches.clone()])?;
+            ctx.register_table("build", Arc::new(table))?;
+        }
+        Some(Binding::Spilled(spilled)) => {
+            ctx.register_table("build", spilled_provider(spilled)?)?;
+        }
+        Some(_) => {
+            return Err(DataFusionError::Plan(format!(
+                "binding '{name}' is not a relation (key collection needs one)"
+            )))
+        }
+        None => return Err(DataFusionError::Plan(format!("unknown binding '{name}'"))),
+    }
 
     let df = ctx
         .table("build")
@@ -586,7 +730,26 @@ async fn register_input(
         ctx.register_table(table_name, Arc::new(ViewTable::new(plan, None)))?;
         return Ok(());
     }
+    if let Some(Binding::Spilled(spilled)) = bindings.get(binding_name) {
+        // A spilled relation streams back from its IPC file; the file is
+        // re-readable, so every consumer registers its own stream and the
+        // last one drops the map entry (the provider keeps the temp file
+        // alive until its execution finishes).
+        let provider = spilled_provider(spilled)?;
+        ctx.register_table(table_name, provider)?;
+        note_use(remaining, binding_name);
+        if uses <= 1 {
+            bindings.remove(binding_name);
+        }
+        return Ok(());
+    }
     force_materialized(bindings, binding_name).await?;
+    if matches!(bindings.get(binding_name), Some(Binding::Spilled(_))) {
+        // Forcing a big lazy region can itself spill; register the stream
+        // through the same arm rather than pulling the file back into RAM.
+        return Box::pin(register_input(ctx, bindings, remaining, table_name, binding_name))
+            .await;
+    }
     let b = consume_materialized(bindings, remaining, binding_name)?;
     let table = MemTable::try_new(b.schema.clone(), vec![b.batches.clone()])
         .map_err(|e| binding_schema_error(binding_name, &b, e))?;
@@ -619,8 +782,7 @@ async fn force_materialized(
         }
         other => other?,
     };
-    bindings.insert(name.to_string(), Binding::Materialized(batches));
-    Ok(())
+    store_relation(bindings, name, batches)
 }
 
 /// Run one composed region to completion. `spillable_joins` plans equi-joins
@@ -1073,6 +1235,7 @@ fn export(
 ) -> PyResult<(SchemaRef, Vec<RecordBatch>)> {
     match bindings.remove(input) {
         Some(Binding::Materialized(b)) => Ok((b.schema, b.batches)),
+        Some(Binding::Spilled(spilled)) => read_spilled(&spilled),
         Some(_) => Err(PyRuntimeError::new_err(format!(
             "cannot return non-relation binding '{input}'"
         ))),
@@ -1080,4 +1243,19 @@ fn export(
             "return of unknown binding '{input}'"
         ))),
     }
+}
+
+/// Read a spilled relation back into memory for the final export (the result
+/// crosses to Python as one Arrow stream today; streaming the file across
+/// the boundary is a follow-up if a >2GB FINAL result ever matters).
+fn read_spilled(spilled: &SpilledBinding) -> PyResult<(SchemaRef, Vec<RecordBatch>)> {
+    let handle = std::fs::File::open(spilled.file.path())
+        .map_err(|e| PyRuntimeError::new_err(format!("binding spill open: {e}")))?;
+    let reader = arrow::ipc::reader::FileReader::try_new(handle, None)
+        .map_err(|e| PyRuntimeError::new_err(format!("binding spill read: {e}")))?;
+    let mut batches = Vec::new();
+    for batch in reader {
+        batches.push(batch.map_err(|e| PyRuntimeError::new_err(format!("binding spill batch: {e}")))?);
+    }
+    Ok((spilled.schema.clone(), batches))
 }
