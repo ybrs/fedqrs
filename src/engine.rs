@@ -8,21 +8,23 @@
 //! crosses the boundary, once.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::{Field, Schema, SchemaRef};
 use datafusion::common::{Column, DataFusionError, JoinType, TableReference};
 use datafusion::datasource::MemTable;
+use datafusion::execution::memory_pool::{FairSpillPool, MemoryConsumer};
+use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
+use futures::StreamExt;
 use datafusion::logical_expr::expr::InList;
 use datafusion::logical_expr::Expr;
-use datafusion::prelude::{col, lit, SessionContext};
+use datafusion::prelude::{col, lit, SessionConfig, SessionContext};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use tokio::runtime::Runtime;
 
 use crate::connectors;
-use crate::ffi::{stream_from_batches, ArrowStreamExport};
 use fedqrs_core::types::DsKind;
 use fedqrs_core::expr::{literal_from_array, to_df_expr};
 use fedqrs_core::ir::{AggCall, AggSelectItem, Fragment, Ir, JoinKind, Projection, ScanSpec, Step};
@@ -52,6 +54,30 @@ const PG_FULL_SCAN_FRACTION: f64 = 0.15;
 const DUCK_TEMP_CAP: usize = 2_000_000;
 const PARALLEL_PARTITIONS: usize = 8;
 const DYN_KEYS_TEMP_TABLE: &str = "fedq_dyn_keys";
+/// DataFusion memory cap. Every context draws from ONE shared pool, so the
+/// engine as a whole is bounded; a fragment that would blow past it (a CROSS
+/// join's cartesian product) fails with ResourcesExhausted instead of OOMing
+/// the server. Sorts and grouped aggregates spill to disk via the default
+/// DiskManager; hash and nested-loop joins do not spill and error instead.
+const MEMORY_LIMIT_BYTES: usize = 32 * 1024 * 1024 * 1024;
+
+/// The shared memory-capped RuntimeEnv (FairSpillPool + default DiskManager)
+/// behind every DataFusion context the engine creates.
+pub(crate) fn runtime_env() -> Arc<RuntimeEnv> {
+    static ENV: OnceLock<Arc<RuntimeEnv>> = OnceLock::new();
+    ENV.get_or_init(|| {
+        RuntimeEnvBuilder::new()
+            .with_memory_pool(Arc::new(FairSpillPool::new(MEMORY_LIMIT_BYTES)))
+            .build_arc()
+            .expect("DataFusion runtime environment construction failed")
+    })
+    .clone()
+}
+
+/// A SessionContext wired to the shared memory-capped runtime.
+fn memory_capped_context() -> SessionContext {
+    SessionContext::new_with_config_rt(SessionConfig::new(), runtime_env())
+}
 
 /// Fully-read Arrow data with its schema.
 struct Batches {
@@ -126,8 +152,11 @@ fn log_step(step: &Step, ir: &Ir, bindings: &HashMap<String, Binding>, elapsed_m
     eprintln!("[fedqrs] {elapsed_ms:9.2}ms  {line}");
 }
 
-/// Interpret `ir` and return the result stream ready for export to Python.
-pub fn execute(ir: &Ir) -> PyResult<ArrowStreamExport> {
+/// Interpret `ir` and return the result schema and batches. Pure Rust with no
+/// Python state, so the caller can run it with the GIL RELEASED - holding the
+/// GIL here would freeze every Python thread (e.g. a watchdog) for the whole
+/// query. The pyo3 wrapper in lib.rs turns the batches into an Arrow stream.
+pub fn execute(ir: &Ir) -> PyResult<(SchemaRef, Vec<RecordBatch>)> {
     let runtime = Runtime::new()
         .map_err(|e| PyRuntimeError::new_err(format!("tokio runtime: {e}")))?;
     let mut bindings: HashMap<String, Binding> = HashMap::new();
@@ -414,7 +443,7 @@ fn temp_table_probe(
 /// DISTINCT of one key column, NULL-free (the full set; the strategy chosen in
 /// `run_injected_scan` decides how to apply it).
 async fn collect_distinct(src: &Batches, key: &str) -> Result<Batches, DataFusionError> {
-    let ctx = SessionContext::new();
+    let ctx = memory_capped_context();
     let table = MemTable::try_new(src.schema.clone(), vec![src.batches.clone()])?;
     ctx.register_table("build", Arc::new(table))?;
 
@@ -426,7 +455,7 @@ async fn collect_distinct(src: &Batches, key: &str) -> Result<Batches, DataFusio
         .distinct()?;
 
     let schema = Arc::new(df.schema().as_arrow().clone());
-    let batches = df.collect().await?;
+    let batches = collect_tracked(df).await?;
     Ok(Batches { schema, batches })
 }
 
@@ -436,7 +465,7 @@ async fn run_fragment(
     fragment: &Fragment,
     inputs: &BTreeMap<String, String>,
 ) -> Result<Batches, DataFusionError> {
-    let ctx = SessionContext::new();
+    let ctx = memory_capped_context();
     for (table_name, binding_name) in inputs {
         let b = take_materialized(bindings, binding_name)?;
         let table = MemTable::try_new(b.schema, vec![b.batches])?;
@@ -544,13 +573,34 @@ async fn collect_batches(
     df: datafusion::dataframe::DataFrame,
 ) -> Result<Batches, DataFusionError> {
     let logical = Arc::new(df.schema().as_arrow().clone());
-    let batches = df.collect().await?;
+    let batches = collect_tracked(df).await?;
     let schema = match batches.first() {
         Some(batch) => nullable_schema(&batch.schema()),
         None => logical,
     };
     let batches = reschema(batches, &schema)?;
     Ok(Batches { schema, batches })
+}
+
+/// Materialize a DataFrame while charging every accumulated batch to the
+/// shared memory pool. Operators only account their WORKING memory, so a
+/// fragment whose OUTPUT explodes (a cross join's cartesian product) would
+/// otherwise grow unseen past the cap and OOM the server; charging the
+/// accumulation makes it fail with ResourcesExhausted instead. The
+/// reservation is released once the batches are handed on as a binding.
+async fn collect_tracked(
+    df: datafusion::dataframe::DataFrame,
+) -> Result<Vec<RecordBatch>, DataFusionError> {
+    let reservation =
+        MemoryConsumer::new("fedq_collect").register(&runtime_env().memory_pool);
+    let mut stream = df.execute_stream().await?;
+    let mut batches = Vec::new();
+    while let Some(item) = stream.next().await {
+        let batch = item?;
+        reservation.try_grow(batch.get_array_memory_size())?;
+        batches.push(batch);
+    }
+    Ok(batches)
 }
 
 /// A copy of `schema` with every field marked nullable, keeping each field's
@@ -733,10 +783,13 @@ fn take_materialized(
     }
 }
 
-/// Export the named binding as a Python-consumable Arrow stream.
-fn export(bindings: &mut HashMap<String, Binding>, input: &str) -> PyResult<ArrowStreamExport> {
+/// Take the named binding as the result schema and batches.
+fn export(
+    bindings: &mut HashMap<String, Binding>,
+    input: &str,
+) -> PyResult<(SchemaRef, Vec<RecordBatch>)> {
     match bindings.remove(input) {
-        Some(Binding::Materialized(b)) => Ok(stream_from_batches(b.schema, b.batches)),
+        Some(Binding::Materialized(b)) => Ok((b.schema, b.batches)),
         Some(_) => Err(PyRuntimeError::new_err(format!(
             "cannot return non-relation binding '{input}'"
         ))),

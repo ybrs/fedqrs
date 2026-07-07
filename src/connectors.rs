@@ -122,7 +122,12 @@ fn parquet_ctx(
     // reordering has real cardinalities (otherwise multi-joins pick bad plans).
     let config = datafusion::execution::config::SessionConfig::new()
         .with_collect_statistics(true);
-    let ctx = datafusion::prelude::SessionContext::new_with_config(config);
+    // Same shared 32 GB memory pool as the merge fragments - the Parquet path
+    // executes DataFusion queries too and must be bounded by the same cap.
+    let ctx = datafusion::prelude::SessionContext::new_with_config_rt(
+        config,
+        crate::engine::runtime_env(),
+    );
     parquet_runtime().block_on(register_parquet_dir(&ctx, dir))?;
     map.insert(dir.to_string(), ctx.clone());
     Ok(ctx)

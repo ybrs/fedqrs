@@ -56,10 +56,14 @@ fn fetch_parallel_to_stream(
 /// Execute a query IR and return the result as an exportable Arrow stream.
 /// Everything runs in Rust; the result is the only thing that crosses back.
 #[pyfunction]
-fn execute_ir(ir_json: &str) -> PyResult<ArrowStreamExport> {
+fn execute_ir(py: Python<'_>, ir_json: &str) -> PyResult<ArrowStreamExport> {
     let ir: ir::Ir = serde_json::from_str(ir_json)
         .map_err(|e| PyValueError::new_err(format!("invalid IR JSON: {e}")))?;
-    engine::execute(&ir)
+    // The engine touches no Python state, so release the GIL for the run.
+    // Holding it would freeze every Python thread in the caller (a memory
+    // watchdog, a UI) for the query's whole duration.
+    let (schema, batches) = py.allow_threads(|| engine::execute(&ir))?;
+    Ok(stream_from_batches(schema, batches))
 }
 
 /// Smoke-test entry point: proves the extension loads and returns a value.
