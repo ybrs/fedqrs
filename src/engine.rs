@@ -464,9 +464,7 @@ async fn run_fragment(
 /// Run pre-rendered SQL over the registered merge inputs (e.g. a whole CTE).
 async fn run_raw_sql(ctx: &SessionContext, sql: &str) -> Result<Batches, DataFusionError> {
     let df = ctx.sql(sql).await?;
-    let schema = Arc::new(df.schema().as_arrow().clone());
-    let batches = df.collect().await?;
-    Ok(Batches { schema, batches })
+    collect_batches(df).await
 }
 
 /// Apply LIMIT/OFFSET over the single input `in_0`.
@@ -533,8 +531,24 @@ async fn run_aggregate(
     sql.push_str(&group_by_clause(group_by, grouping_sets)?);
 
     let df = ctx.sql(&sql).await?;
-    let schema = Arc::new(df.schema().as_arrow().clone());
+    collect_batches(df).await
+}
+
+/// Collect a DataFrame into Batches carrying the PHYSICAL schema of the executed
+/// data. DataFusion's logical `df.schema()` can disagree with the collected
+/// batch schema - notably the decimal precision SUM widens (Decimal(17,2) ->
+/// Decimal(27,2)) - and a Binding must carry the schema its batches actually
+/// have, or registering it as a MemTable rejects it ("Mismatch between schema
+/// and batches"; q16/q94/q95). Falls back to the logical schema when empty.
+async fn collect_batches(
+    df: datafusion::dataframe::DataFrame,
+) -> Result<Batches, DataFusionError> {
+    let logical = Arc::new(df.schema().as_arrow().clone());
     let batches = df.collect().await?;
+    let schema = match batches.first() {
+        Some(batch) => batch.schema(),
+        None => logical,
+    };
     Ok(Batches { schema, batches })
 }
 
