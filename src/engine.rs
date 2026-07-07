@@ -12,8 +12,10 @@ use std::sync::{Arc, OnceLock};
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::{Field, Schema, SchemaRef};
+use datafusion::catalog::view::ViewTable;
 use datafusion::common::{Column, DataFusionError, JoinType, TableReference};
 use datafusion::datasource::MemTable;
+use datafusion::logical_expr::LogicalPlan;
 use datafusion::execution::memory_pool::{FairSpillPool, MemoryConsumer};
 use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
 use futures::StreamExt;
@@ -91,6 +93,12 @@ enum Binding {
     Materialized(Batches),
     /// The build side's distinct, NULL-free join-key values.
     Keys(Batches),
+    /// A fragment's COMPOSED logical plan, not yet executed. Single-use
+    /// chains of merge fragments fuse through this into ONE streaming
+    /// DataFusion execution at the next pipeline breaker (a key collection,
+    /// a multi-consumer, the return) instead of draining per step - which is
+    /// what let SF10 intermediates blow the memory pool.
+    Lazy(LogicalPlan),
 }
 
 fn df_to_py(e: DataFusionError) -> PyErr {
@@ -109,6 +117,8 @@ fn binding_rows(bindings: &HashMap<String, Binding>, name: &str) -> usize {
         Some(Binding::Materialized(b)) | Some(Binding::Keys(b)) => {
             b.batches.iter().map(|x| x.num_rows()).sum()
         }
+        // A lazy binding has no rows yet; the forcing step reports them.
+        Some(Binding::Lazy(_)) => 0,
         None => 0,
     }
 }
@@ -172,6 +182,9 @@ pub fn execute(ir: &Ir) -> PyResult<(SchemaRef, Vec<RecordBatch>)> {
             }
 
             Step::CollectDistinct { input, key, cap: _, binding } => {
+                runtime
+                    .block_on(force_materialized(&mut bindings, input))
+                    .map_err(df_to_py)?;
                 let src = materialized(&bindings, input)?;
                 let keys = runtime
                     .block_on(collect_distinct(src, key))
@@ -197,10 +210,13 @@ pub fn execute(ir: &Ir) -> PyResult<(SchemaRef, Vec<RecordBatch>)> {
                 let result = runtime
                     .block_on(run_fragment(&mut bindings, &mut remaining, frag, inputs))
                     .map_err(df_to_py)?;
-                bindings.insert(binding.clone(), Binding::Materialized(result));
+                bindings.insert(binding.clone(), result);
             }
 
             Step::Return { input } => {
+                runtime
+                    .block_on(force_materialized(&mut bindings, input))
+                    .map_err(df_to_py)?;
                 return export(&mut bindings, input);
             }
         }
@@ -495,37 +511,120 @@ async fn collect_distinct(src: &Batches, key: &str) -> Result<Batches, DataFusio
     Ok(Batches { schema, batches })
 }
 
-/// Register the fragment's inputs and run it on DataFusion.
+/// Register the fragment's inputs and COMPOSE it on DataFusion.
+///
+/// The fragment is planned, not executed: the result is a Lazy binding so a
+/// chain of single-use fragments fuses into one streaming execution at the
+/// next pipeline breaker. The two exceptions materialize here: the
+/// cardinality guard (its probe must see every input row) and a projection
+/// with duplicate output names (see projected_binding).
 async fn run_fragment(
     bindings: &mut HashMap<String, Binding>,
     remaining: &mut HashMap<String, usize>,
     fragment: &Fragment,
     inputs: &BTreeMap<String, String>,
-) -> Result<Batches, DataFusionError> {
+) -> Result<Binding, DataFusionError> {
     let ctx = memory_capped_context();
     for (table_name, binding_name) in inputs {
-        let b = consume_materialized(bindings, remaining, binding_name)?;
-        let table = MemTable::try_new(b.schema.clone(), vec![b.batches.clone()])
-            .map_err(|e| binding_schema_error(binding_name, &b, e))?;
-        ctx.register_table(table_name.as_str(), Arc::new(table))?;
+        register_input(&ctx, bindings, remaining, table_name, binding_name).await?;
     }
 
     match fragment {
         Fragment::HashJoin { join_type, left_keys, right_keys, project } => {
-            run_hash_join(&ctx, *join_type, left_keys, right_keys, project).await
+            let joined = join_frame(&ctx, *join_type, left_keys, right_keys).await?;
+            projected_binding(joined, project, false).await
         }
         Fragment::NestedLoopJoin { join_type, condition, project } => {
-            run_nested_loop_join(&ctx, *join_type, condition, project).await
+            let joined = nested_loop_frame(&ctx, *join_type, condition).await?;
+            projected_binding(joined, project, false).await
         }
-        Fragment::Project { project, distinct } => run_project(&ctx, project, *distinct).await,
+        Fragment::Project { project, distinct } => {
+            let frame = ctx.table("in_0").await?;
+            projected_binding(frame, project, *distinct).await
+        }
         Fragment::Aggregate { select, group_by, grouping_sets } => {
-            run_aggregate(&ctx, select, group_by, grouping_sets).await
+            Ok(lazy(run_aggregate(&ctx, select, group_by, grouping_sets).await?))
         }
-        Fragment::Sort { keys } => run_sort(&ctx, keys).await,
-        Fragment::Filter { predicate } => run_filter(&ctx, predicate).await,
-        Fragment::Limit { limit, offset } => run_limit(&ctx, *limit, *offset).await,
-        Fragment::SingleRowGuard { keys } => run_single_row_guard(&ctx, keys).await,
-        Fragment::RawSql { sql } => run_raw_sql(&ctx, sql).await,
+        Fragment::Sort { keys } => Ok(lazy(run_sort(&ctx, keys).await?)),
+        Fragment::Filter { predicate } => Ok(lazy(run_filter(&ctx, predicate).await?)),
+        Fragment::Limit { limit, offset } => {
+            Ok(lazy(run_limit(&ctx, *limit, *offset).await?))
+        }
+        Fragment::SingleRowGuard { keys } => {
+            // The guard EXECUTES its cardinality probe over the whole input,
+            // so its passthrough result is materialized, never lazy.
+            Ok(Binding::Materialized(run_single_row_guard(&ctx, keys).await?))
+        }
+        Fragment::RawSql { sql } => Ok(lazy(run_raw_sql(&ctx, sql).await?)),
+    }
+}
+
+/// Wrap a composed DataFrame as a lazy binding.
+fn lazy(frame: datafusion::dataframe::DataFrame) -> Binding {
+    Binding::Lazy(frame.into_unoptimized_plan())
+}
+
+/// Register one merge input on the fragment's scratch context.
+///
+/// A single-use LAZY binding registers as a VIEW over its composed plan, so
+/// the region keeps streaming. Anything else materializes first - a
+/// multi-consumer must not re-execute its plan once per reader (that would
+/// be the CTE re-emission disease again) - and registers as a MemTable.
+async fn register_input(
+    ctx: &SessionContext,
+    bindings: &mut HashMap<String, Binding>,
+    remaining: &mut HashMap<String, usize>,
+    table_name: &str,
+    binding_name: &str,
+) -> Result<(), DataFusionError> {
+    let uses = remaining.get(binding_name).copied().unwrap_or(0);
+    let single_use_lazy =
+        uses <= 1 && matches!(bindings.get(binding_name), Some(Binding::Lazy(_)));
+    if single_use_lazy {
+        note_use(remaining, binding_name);
+        let plan = take_lazy(bindings, binding_name)?;
+        ctx.register_table(table_name, Arc::new(ViewTable::new(plan, None)))?;
+        return Ok(());
+    }
+    force_materialized(bindings, binding_name).await?;
+    let b = consume_materialized(bindings, remaining, binding_name)?;
+    let table = MemTable::try_new(b.schema.clone(), vec![b.batches.clone()])
+        .map_err(|e| binding_schema_error(binding_name, &b, e))?;
+    ctx.register_table(table_name, Arc::new(table))?;
+    Ok(())
+}
+
+/// Execute a lazy binding's composed plan and replace it with materialized
+/// batches. A fused region runs HERE, as one streaming DataFusion execution
+/// whose operators spill through the shared runtime while collect_tracked
+/// accounts the accumulated result. A no-op for non-lazy bindings.
+async fn force_materialized(
+    bindings: &mut HashMap<String, Binding>,
+    name: &str,
+) -> Result<(), DataFusionError> {
+    if !matches!(bindings.get(name), Some(Binding::Lazy(_))) {
+        return Ok(());
+    }
+    let plan = take_lazy(bindings, name)?;
+    let ctx = memory_capped_context();
+    let frame = ctx.execute_logical_plan(plan).await?;
+    let batches = collect_batches(frame).await?;
+    bindings.insert(name.to_string(), Binding::Materialized(batches));
+    Ok(())
+}
+
+/// Take a binding out of the map as a lazy plan.
+fn take_lazy(
+    bindings: &mut HashMap<String, Binding>,
+    name: &str,
+) -> Result<LogicalPlan, DataFusionError> {
+    match bindings.remove(name) {
+        Some(Binding::Lazy(plan)) => Ok(plan),
+        Some(other) => {
+            bindings.insert(name.to_string(), other);
+            Err(DataFusionError::Plan(format!("binding '{name}' is not lazy")))
+        }
+        None => Err(DataFusionError::Plan(format!("unknown binding '{name}'"))),
     }
 }
 
@@ -560,10 +659,12 @@ async fn run_single_row_guard(
     collect_batches(ctx.table("in_0").await?).await
 }
 
-/// Run pre-rendered SQL over the registered merge inputs (e.g. a whole CTE).
-async fn run_raw_sql(ctx: &SessionContext, sql: &str) -> Result<Batches, DataFusionError> {
-    let df = ctx.sql(sql).await?;
-    collect_batches(df).await
+/// Plan pre-rendered SQL over the registered merge inputs (e.g. a whole CTE).
+async fn run_raw_sql(
+    ctx: &SessionContext,
+    sql: &str,
+) -> Result<datafusion::dataframe::DataFrame, DataFusionError> {
+    ctx.sql(sql).await
 }
 
 /// Apply LIMIT/OFFSET over the single input `in_0`.
@@ -571,31 +672,28 @@ async fn run_limit(
     ctx: &SessionContext,
     limit: Option<usize>,
     offset: usize,
-) -> Result<Batches, DataFusionError> {
-    let limited = ctx.table("in_0").await?.limit(offset, limit)?;
-    collect_batches(limited).await
+) -> Result<datafusion::dataframe::DataFrame, DataFusionError> {
+    ctx.table("in_0").await?.limit(offset, limit)
 }
 
-/// Filter the single input `in_0` by a boolean predicate.
+/// Plan a boolean filter over the single input `in_0`.
 async fn run_filter(
     ctx: &SessionContext,
     predicate: &fedqrs_core::ir::IrExpr,
-) -> Result<Batches, DataFusionError> {
-    let filtered = ctx.table("in_0").await?.filter(to_df_expr(predicate)?)?;
-    collect_batches(filtered).await
+) -> Result<datafusion::dataframe::DataFrame, DataFusionError> {
+    ctx.table("in_0").await?.filter(to_df_expr(predicate)?)
 }
 
-/// Order the single input `in_0` by the given keys.
+/// Plan an ORDER BY over the single input `in_0`.
 async fn run_sort(
     ctx: &SessionContext,
     keys: &[fedqrs_core::ir::SortKey],
-) -> Result<Batches, DataFusionError> {
+) -> Result<datafusion::dataframe::DataFrame, DataFusionError> {
     let mut sort_exprs = Vec::with_capacity(keys.len());
     for k in keys {
         sort_exprs.push(to_df_expr(&k.expr)?.sort(k.ascending, k.nulls_first));
     }
-    let sorted = ctx.table("in_0").await?.sort(sort_exprs)?;
-    collect_batches(sorted).await
+    ctx.table("in_0").await?.sort(sort_exprs)
 }
 
 /// Run a GROUP BY over the single input `in_0` by building DataFusion SQL, so
@@ -605,7 +703,7 @@ async fn run_aggregate(
     select: &[AggSelectItem],
     group_by: &[fedqrs_core::ir::IrExpr],
     grouping_sets: &[Vec<fedqrs_core::ir::IrExpr>],
-) -> Result<Batches, DataFusionError> {
+) -> Result<datafusion::dataframe::DataFrame, DataFusionError> {
     let mut items = Vec::with_capacity(select.len());
     for item in select {
         let rendered = match (&item.agg, &item.expr) {
@@ -623,8 +721,7 @@ async fn run_aggregate(
     let mut sql = format!("SELECT {} FROM \"in_0\"", items.join(", "));
     sql.push_str(&group_by_clause(group_by, grouping_sets)?);
 
-    let df = ctx.sql(&sql).await?;
-    collect_batches(df).await
+    ctx.sql(&sql).await
 }
 
 /// Collect a DataFrame into Batches under ONE schema all batches conform to.
@@ -743,27 +840,48 @@ fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
-/// Evaluate a projection over the single input `in_0`.
-async fn run_project(
-    ctx: &SessionContext,
-    project: &[Projection],
-    distinct: bool,
-) -> Result<Batches, DataFusionError> {
-    project_dataframe_dedup(ctx.table("in_0").await?, project, distinct).await
-}
-
-/// Project a DataFrame to its output columns. Each expression is aliased to a
-/// unique internal name (DataFusion requires unique projection names), then the
-/// result schema is renamed to the intended output names - which MAY repeat, as
-/// SQL allows (`SELECT a, a`, self-joins); Arrow permits duplicate field names.
-async fn project_dataframe(
+/// Project a composed frame to its output columns, lazily when possible.
+///
+/// Unique output names alias straight into the plan (the composed region
+/// keeps streaming). Duplicate output names - legal SQL (`SELECT a, a`) that
+/// a DataFusion projection cannot express - fall back to the eager path:
+/// alias to unique internal names, execute, and rename the collected schema
+/// (Arrow permits duplicate field names).
+async fn projected_binding(
     df: datafusion::dataframe::DataFrame,
     project: &[Projection],
-) -> Result<Batches, DataFusionError> {
-    project_dataframe_dedup(df, project, false).await
+    distinct: bool,
+) -> Result<Binding, DataFusionError> {
+    if !unique_aliases(project) {
+        return Ok(Binding::Materialized(
+            project_dataframe_dedup(df, project, distinct).await?,
+        ));
+    }
+    let mut exprs = Vec::with_capacity(project.len());
+    for p in project {
+        exprs.push(to_df_expr(&p.expr)?.alias(&p.alias));
+    }
+    let mut projected = df.select(exprs)?;
+    if distinct {
+        projected = projected.distinct()?;
+    }
+    Ok(lazy(projected))
 }
 
-/// `project_dataframe` with an optional DISTINCT over the projected rows.
+/// Whether every projection output name is unique.
+fn unique_aliases(project: &[Projection]) -> bool {
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for p in project {
+        if !seen.insert(p.alias.as_str()) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Eagerly project to output columns with duplicate names: alias each
+/// expression to a unique internal name, execute, then rename the collected
+/// schema to the intended (repeating) output names.
 async fn project_dataframe_dedup(
     df: datafusion::dataframe::DataFrame,
     project: &[Projection],
@@ -805,37 +923,34 @@ fn reschema(
     Ok(out)
 }
 
-async fn run_hash_join(
+/// Plan an equi-join of `in_left` and `in_right` on paired key columns.
+async fn join_frame(
     ctx: &SessionContext,
     join_type: JoinKind,
     left_keys: &[String],
     right_keys: &[String],
-    project: &[Projection],
-) -> Result<Batches, DataFusionError> {
+) -> Result<datafusion::dataframe::DataFrame, DataFusionError> {
     let left = ctx.table("in_left").await?;
     let right = ctx.table("in_right").await?;
     let lk: Vec<&str> = left_keys.iter().map(|s| s.as_str()).collect();
     let rk: Vec<&str> = right_keys.iter().map(|s| s.as_str()).collect();
-
-    let joined = left.join(right, datafusion_join_type(join_type), &lk, &rk, None)?;
-    project_dataframe(joined, project).await
+    left.join(right, datafusion_join_type(join_type), &lk, &rk, None)
 }
 
-/// A non-equi (nested-loop) join on an arbitrary condition (`None` = cross join).
-async fn run_nested_loop_join(
+/// Plan a non-equi (nested-loop) join on an arbitrary condition (`None` =
+/// cross join) of `in_left` and `in_right`.
+async fn nested_loop_frame(
     ctx: &SessionContext,
     join_type: JoinKind,
     condition: &Option<fedqrs_core::ir::IrExpr>,
-    project: &[Projection],
-) -> Result<Batches, DataFusionError> {
+) -> Result<datafusion::dataframe::DataFrame, DataFusionError> {
     let left = ctx.table("in_left").await?;
     let right = ctx.table("in_right").await?;
     let on_exprs = match condition {
         Some(expr) => vec![to_df_expr(expr)?],
         None => Vec::new(),
     };
-    let joined = left.join_on(right, datafusion_join_type(join_type), on_exprs)?;
-    project_dataframe(joined, project).await
+    left.join_on(right, datafusion_join_type(join_type), on_exprs)
 }
 
 /// Map the IR join kind to DataFusion's. A free function, not a `From` impl:
