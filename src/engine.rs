@@ -505,7 +505,8 @@ async fn run_fragment(
     let ctx = memory_capped_context();
     for (table_name, binding_name) in inputs {
         let b = consume_materialized(bindings, remaining, binding_name)?;
-        let table = MemTable::try_new(b.schema, vec![b.batches])?;
+        let table = MemTable::try_new(b.schema.clone(), vec![b.batches.clone()])
+            .map_err(|e| binding_schema_error(binding_name, &b, e))?;
         ctx.register_table(table_name.as_str(), Arc::new(table))?;
     }
 
@@ -849,6 +850,27 @@ fn datafusion_join_type(k: JoinKind) -> JoinType {
         JoinKind::Semi => JoinType::LeftSemi,
         JoinKind::Anti => JoinType::LeftAnti,
     }
+}
+
+/// Name the binding and the exact field difference when its batches do not
+/// match its declared schema - "Mismatch between schema and batches" alone
+/// says neither which input nor which column diverged.
+fn binding_schema_error(name: &str, b: &Batches, source: DataFusionError) -> DataFusionError {
+    let declared = b.schema.as_ref().clone();
+    let executed = match b.batches.first() {
+        Some(batch) => batch.schema().as_ref().clone(),
+        None => return source,
+    };
+    let mut diffs = Vec::new();
+    for (df, ef) in declared.fields().iter().zip(executed.fields()) {
+        if !df.contains(ef) {
+            diffs.push(format!("declared {df:?} vs executed {ef:?}"));
+        }
+    }
+    DataFusionError::Plan(format!(
+        "binding '{name}' schema/batches mismatch: {}",
+        diffs.join("; ")
+    ))
 }
 
 /// Consume a binding as materialized batches. The LAST reader takes it out

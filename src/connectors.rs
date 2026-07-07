@@ -275,7 +275,66 @@ fn run_query(
     for batch in reader {
         batches.push(batch.map_err(|e| format!("adbc batch: {e}"))?);
     }
-    normalize_numeric(schema, batches).map_err(|e| format!("numeric normalize: {e}"))
+    let (schema, batches) =
+        normalize_numeric(schema, batches).map_err(|e| format!("numeric normalize: {e}"))?;
+    reconcile_executed(schema, batches).map_err(|e| format!("schema reconcile: {e}"))
+}
+
+/// Make the reported schema agree with the executed batches.
+///
+/// ADBC can report a result column at one type while the batches arrive at
+/// another: a temp-join result loses the NUMERIC typmod, so the stream schema
+/// says Decimal128(38, 0) while the data-derived batches carry (38, 2) - and
+/// without the typname metadata `normalize_numeric` never touches it (TPC-DS
+/// q64 at SF1). A binding whose declared schema disagrees with its executed
+/// batches poisons every downstream MemTable registration, so disagreeing
+/// Decimal columns re-derive through the same string round-trip the metadata
+/// path uses; any other disagreement is a driver contract violation and
+/// fails loudly rather than shipping a lying schema.
+fn reconcile_executed(
+    schema: SchemaRef,
+    batches: Vec<RecordBatch>,
+) -> Result<(SchemaRef, Vec<RecordBatch>), arrow::error::ArrowError> {
+    let mut decimals: Vec<usize> = Vec::new();
+    for batch in &batches {
+        if batch.schema() == schema {
+            continue;
+        }
+        collect_decimal_disagreements(&schema, &batch.schema(), &mut decimals)?;
+    }
+    if decimals.is_empty() {
+        return Ok((schema, batches));
+    }
+    rebuild_decimals(schema, batches, &decimals)
+}
+
+/// Record the columns where two schemas disagree on a Decimal128 type; any
+/// non-decimal disagreement is a driver contract violation and fails loudly.
+fn collect_decimal_disagreements(
+    schema: &SchemaRef,
+    executed: &SchemaRef,
+    decimals: &mut Vec<usize>,
+) -> Result<(), arrow::error::ArrowError> {
+    for (index, field) in schema.fields().iter().enumerate() {
+        let executed_type = executed.field(index).data_type();
+        if executed_type == field.data_type() {
+            continue;
+        }
+        let both_decimal = matches!(field.data_type(), DataType::Decimal128(_, _))
+            && matches!(executed_type, DataType::Decimal128(_, _));
+        if !both_decimal {
+            return Err(arrow::error::ArrowError::SchemaError(format!(
+                "column '{}' reported as {:?} but executed as {:?}",
+                field.name(),
+                field.data_type(),
+                executed_type
+            )));
+        }
+        if !decimals.contains(&index) {
+            decimals.push(index);
+        }
+    }
+    Ok(())
 }
 
 /// Run a statement with no result set (DDL: DROP TABLE, etc.).
@@ -313,8 +372,17 @@ fn normalize_numeric(
     if numeric.is_empty() {
         return Ok((schema, batches));
     }
+    rebuild_decimals(schema, batches, &numeric)
+}
 
-    let (strings, scales) = decimal_strings_and_scales(&numeric, &batches)?;
+/// Re-derive the given columns as Decimal128 with a data-derived scale (via a
+/// string round-trip) and rebuild every batch under the one resulting schema.
+fn rebuild_decimals(
+    schema: SchemaRef,
+    batches: Vec<RecordBatch>,
+    columns: &[usize],
+) -> Result<(SchemaRef, Vec<RecordBatch>), arrow::error::ArrowError> {
+    let (strings, scales) = decimal_strings_and_scales(columns, &batches)?;
     let new_schema = decimal_schema(&schema, &scales);
     let mut out = Vec::with_capacity(batches.len());
     for (bi, batch) in batches.iter().enumerate() {
@@ -540,7 +608,13 @@ pub fn fetch_parallel(
     }
     let result_schema = result_schema
         .ok_or_else(|| PyRuntimeError::new_err("parallel fetch produced no partitions"))?;
-    Ok((result_schema, all))
+    // Partitions normalize their NUMERIC scales independently from their own
+    // rows: an empty (or integral-only) FIRST partition reports scale 0 while
+    // a later partition's batches carry the data-derived scale (TPC-DS q64 at
+    // SF1: item filtered to 12 rows across 8 ctid ranges). Reconcile so the
+    // one result schema agrees with EVERY batch.
+    reconcile_executed(result_schema, all)
+        .map_err(|e| PyRuntimeError::new_err(format!("parallel schema reconcile: {e}")))
 }
 
 // --- temp-table dynamic-filter pushdown --------------------------------------
