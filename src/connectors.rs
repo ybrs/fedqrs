@@ -68,6 +68,71 @@ thread_local! {
     // ADBC handles are not Send, and all fetches run on this one thread, so a
     // thread-local cache pools connections without any locking.
     static PG_CACHE: RefCell<HashMap<String, PgConn>> = RefCell::new(HashMap::new());
+    // DuckDB connections PINNED for the current query, keyed by database
+    // path. A pinned connection exists only after a `ship` step created a
+    // temp table on it: temp objects are per-connection, so every later
+    // fetch against that database must run on the SAME connection to see
+    // the shipped relation. Cleared (dropping the temp tables with it) at
+    // query end by `clear_shipments`.
+    static PINNED_DUCK: RefCell<HashMap<String, duckdb::Connection>> = RefCell::new(HashMap::new());
+}
+
+/// Materialize a relation as a TEMP TABLE on the target DuckDB source, on a
+/// connection pinned for the rest of the query.
+pub fn ship_table(
+    name: &str,
+    table: &str,
+    schema: SchemaRef,
+    batches: Vec<RecordBatch>,
+) -> PyResult<()> {
+    let s = spec(name)?;
+    if s.kind != DsKind::DuckDb {
+        return Err(PyRuntimeError::new_err(format!(
+            "ship target '{name}' is not DuckDB (dim shipping supports DuckDB only)"
+        )));
+    }
+    PINNED_DUCK.with(|cache| {
+        let mut map = cache.borrow_mut();
+        if !map.contains_key(&s.uri) {
+            map.insert(s.uri.clone(), duck_cursor(&s.uri)?);
+        }
+        let conn = map.get(&s.uri).unwrap();
+        create_shipped_table(conn, table, &schema, batches)
+    })
+}
+
+/// Drop every pinned connection (and with it every shipped temp table).
+pub fn clear_shipments() {
+    PINNED_DUCK.with(|cache| cache.borrow_mut().clear());
+}
+
+fn create_shipped_table(
+    conn: &duckdb::Connection,
+    table: &str,
+    schema: &SchemaRef,
+    batches: Vec<RecordBatch>,
+) -> PyResult<()> {
+    let mut columns = Vec::with_capacity(schema.fields().len());
+    for field in schema.fields() {
+        let duck_type = duck_type_name(field.data_type()).map_err(PyRuntimeError::new_err)?;
+        columns.push(format!("\"{}\" {}", field.name().replace('"', "\"\""), duck_type));
+    }
+    let quoted = table.replace('"', "\"\"");
+    let create = format!(
+        "DROP TABLE IF EXISTS \"{quoted}\"; CREATE TEMP TABLE \"{quoted}\" ({})",
+        columns.join(", ")
+    );
+    conn.execute_batch(&create)
+        .map_err(|e| PyRuntimeError::new_err(format!("duckdb ship table: {e}")))?;
+    let mut appender = conn
+        .appender(table)
+        .map_err(|e| PyRuntimeError::new_err(format!("duckdb ship appender: {e}")))?;
+    for batch in batches {
+        appender
+            .append_record_batch(batch)
+            .map_err(|e| PyRuntimeError::new_err(format!("duckdb ship ingest: {e}")))?;
+    }
+    Ok(())
 }
 
 /// Run `sql` against the named source over its native driver and return the
@@ -200,9 +265,28 @@ fn duck_cursor(path: &str) -> PyResult<duckdb::Connection> {
 }
 
 fn fetch_duckdb(s: &DsSpec, sql: &str) -> PyResult<(SchemaRef, Vec<RecordBatch>)> {
+    // A query that shipped a temp table must keep reading on the pinned
+    // connection - temp objects are invisible to other cursors.
+    let pinned = PINNED_DUCK.with(|cache| {
+        let map = cache.borrow();
+        match map.get(&s.uri) {
+            Some(conn) => Some(run_duckdb_query(conn, sql)),
+            None => None,
+        }
+    });
+    if let Some(result) = pinned {
+        return result;
+    }
     // A cursor on the process-wide cached instance (see `duck_cursor`): the
     // ~7-10ms DuckDB instance creation is paid once per file, not once per fetch.
     let conn = duck_cursor(&s.uri)?;
+    run_duckdb_query(&conn, sql)
+}
+
+fn run_duckdb_query(
+    conn: &duckdb::Connection,
+    sql: &str,
+) -> PyResult<(SchemaRef, Vec<RecordBatch>)> {
     let mut stmt = conn
         .prepare(sql)
         .map_err(|e| PyRuntimeError::new_err(format!("duckdb prepare: {e}")))?;

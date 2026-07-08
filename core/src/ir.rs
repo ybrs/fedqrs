@@ -82,6 +82,16 @@ pub enum Step {
         extra_injections: Vec<ExtraInjection>,
     },
 
+    /// Materialize a binding as a TEMP TABLE on a target source, so a later
+    /// scan on that source can join it natively (dim shipping: a small
+    /// filtered dimension travels TO the fact's source and the whole
+    /// join+aggregate collapses into one island there).
+    Ship {
+        datasource: String,
+        input: String,
+        table: String,
+    },
+
     /// Run a relational fragment over named inputs and bind its result. `inputs`
     /// maps the fragment's input table name (e.g. `in_left`) to a binding.
     Merge {

@@ -335,9 +335,22 @@ fn log_step(step: &Step, ir: &Ir, bindings: &HashMap<String, Binding>, elapsed_m
             let kind = ir.fragments.get(fragment).map_or("?", fragment_kind);
             format!("merge         {kind:<16} rows={}", binding_rows(bindings, binding))
         }
+        Step::Ship { datasource, table, .. } => {
+            format!("ship          ds={datasource:<6} table={table}")
+        }
         Step::Return { .. } => "return".to_string(),
     };
     eprintln!("[fedqrs] {elapsed_ms:9.2}ms  {line}");
+}
+
+/// Drops the query's shipped temp tables (by dropping their pinned
+/// connections) on EVERY exit path, error or success.
+struct ShipmentGuard;
+
+impl Drop for ShipmentGuard {
+    fn drop(&mut self) {
+        connectors::clear_shipments();
+    }
 }
 
 /// Interpret `ir` and return the result schema and batches. Pure Rust with no
@@ -345,6 +358,11 @@ fn log_step(step: &Step, ir: &Ir, bindings: &HashMap<String, Binding>, elapsed_m
 /// GIL here would freeze every Python thread (e.g. a watchdog) for the whole
 /// query. The pyo3 wrapper in lib.rs turns the batches into an Arrow stream.
 pub fn execute(ir: &Ir) -> PyResult<(SchemaRef, Vec<RecordBatch>)> {
+    // Shipped temp tables are strictly per-query; drop any pinned
+    // connections a previous query left (also cleared on every exit path
+    // by the guard below - this is the defensive backstop).
+    connectors::clear_shipments();
+    let _shipments = ShipmentGuard;
     let runtime = Runtime::new()
         .map_err(|e| PyRuntimeError::new_err(format!("tokio runtime: {e}")))?;
     let mut bindings: HashMap<String, Binding> = HashMap::new();
@@ -389,6 +407,15 @@ pub fn execute(ir: &Ir) -> PyResult<(SchemaRef, Vec<RecordBatch>)> {
                     note_use(&mut remaining, &extra.keys_from);
                 }
                 store_relation(&mut bindings, binding, batches).map_err(df_to_py)?;
+            }
+
+            Step::Ship { datasource, input, table } => {
+                runtime
+                    .block_on(force_materialized(&mut bindings, input))
+                    .map_err(df_to_py)?;
+                let b = materialized(&bindings, input)?;
+                connectors::ship_table(datasource, table, b.schema.clone(), b.batches.clone())?;
+                note_use(&mut remaining, input);
             }
 
             Step::Merge { fragment, inputs, binding } => {
@@ -437,6 +464,7 @@ fn binding_use_counts(ir: &Ir) -> HashMap<String, usize> {
     for step in &ir.steps {
         match step {
             Step::SourceScan { .. } => {}
+            Step::Ship { input, .. } => bump(input),
             Step::CollectDistinct { input, .. } => bump(input),
             Step::InjectedScan { keys_from, extra_injections, .. } => {
                 bump(keys_from);
