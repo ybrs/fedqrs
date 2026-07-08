@@ -82,6 +82,18 @@ thread_local! {
     static SHIPPED_PG: RefCell<Vec<(String, String)>> = RefCell::new(Vec::new());
 }
 
+/// A hard safety backstop on how many rows a single shipped relation may hold.
+/// The optimizer only ships a dimension it ESTIMATES at <= ~200k rows
+/// (SHIP_ROW_BUDGET in the planner), so this cap never trips a correct decision
+/// - it exists solely to catch STALE STATS: a dimension estimated small but
+/// actually huge, which would otherwise ingest for minutes-to-hours and hammer
+/// the target (an ADBC binary-COPY of a giant relation into Postgres). Failing
+/// loud here turns that runaway into an immediate, honest crash - a crash never
+/// ships a lie. The value is a deliberately large multiple of the plan budget;
+/// there is no query-derived "right" number for a safety valve, so it is a fixed
+/// constant for now and will move to user-overridable settings later.
+const SHIP_MAX_ROWS: usize = 50_000_000;
+
 /// Materialize a relation as a TEMP TABLE on the target source (DuckDB or
 /// Postgres), visible to that source's later reads this query. The optimizer
 /// chooses the target by cost; the engine supports both writable sources.
@@ -91,6 +103,14 @@ pub fn ship_table(
     schema: SchemaRef,
     batches: Vec<RecordBatch>,
 ) -> PyResult<()> {
+    let rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
+    if rows > SHIP_MAX_ROWS {
+        return Err(PyRuntimeError::new_err(format!(
+            "dim shipping refused: table '{table}' has {rows} rows, over the hard \
+             cap of {SHIP_MAX_ROWS} - stale stats likely mis-planned this ship; \
+             not ingesting"
+        )));
+    }
     let s = spec(name)?;
     match s.kind {
         DsKind::DuckDb => ship_table_duckdb(&s, table, schema, batches),
@@ -138,7 +158,13 @@ fn ship_table_postgres(
         }
         let pg = map.get_mut(name).unwrap();
         exec_update(&mut pg.conn, &drop_sql).map_err(PyRuntimeError::new_err)?;
-        ingest_temp(&mut pg.conn, table, schema, batches).map_err(PyRuntimeError::new_err)
+        ingest_temp(&mut pg.conn, table, schema, batches).map_err(PyRuntimeError::new_err)?;
+        // ANALYZE the freshly-ingested temp table so Postgres plans the island
+        // join over real row counts / NDVs instead of the default guess for an
+        // unstatted relation. The ingest already succeeded, so a failure here is
+        // real and propagates rather than being swallowed.
+        let analyze_sql = format!("ANALYZE \"{}\"", table.replace('"', "\"\""));
+        exec_update(&mut pg.conn, &analyze_sql).map_err(PyRuntimeError::new_err)
     })?;
     SHIPPED_PG.with(|s| s.borrow_mut().push((name.to_string(), table.to_string())));
     Ok(())
