@@ -371,11 +371,23 @@ pub fn execute(ir: &Ir) -> PyResult<(SchemaRef, Vec<RecordBatch>)> {
 
             Step::InjectedScan {
                 datasource, scan, inject_column, keys_from, binding, inject_column_ndv,
+                extra_injections,
             } => {
                 let keys = keys_binding(&bindings, keys_from)?;
-                let batches =
-                    run_injected_scan(datasource, scan, inject_column, keys, *inject_column_ndv)?;
+                let mut extras: Vec<(&str, &Batches)> = Vec::new();
+                for extra in extra_injections {
+                    extras.push((
+                        extra.column.as_str(),
+                        keys_binding(&bindings, &extra.keys_from)?,
+                    ));
+                }
+                let batches = run_injected_scan(
+                    datasource, scan, inject_column, keys, *inject_column_ndv, &extras,
+                )?;
                 note_use(&mut remaining, keys_from);
+                for extra in extra_injections {
+                    note_use(&mut remaining, &extra.keys_from);
+                }
                 store_relation(&mut bindings, binding, batches).map_err(df_to_py)?;
             }
 
@@ -426,7 +438,12 @@ fn binding_use_counts(ir: &Ir) -> HashMap<String, usize> {
         match step {
             Step::SourceScan { .. } => {}
             Step::CollectDistinct { input, .. } => bump(input),
-            Step::InjectedScan { keys_from, .. } => bump(keys_from),
+            Step::InjectedScan { keys_from, extra_injections, .. } => {
+                bump(keys_from);
+                for extra in extra_injections {
+                    bump(&extra.keys_from);
+                }
+            }
             Step::Merge { inputs, .. } => {
                 for name in inputs.values() {
                     bump(name);
@@ -524,8 +541,13 @@ fn run_injected_scan(
     inject_column: &str,
     keys: &Batches,
     inject_column_ndv: Option<u64>,
+    extras: &[(&str, &Batches)],
 ) -> PyResult<Batches> {
     let num_keys: usize = keys.batches.iter().map(|b| b.num_rows()).sum();
+    // Additional dimensions' keys ride along as bounded IN lists wherever a
+    // filter slot exists (an over-cap extra is skipped - extras are a
+    // bonus; the primary injection carries the reduction contract).
+    let extra_filter = extras_in_filter(extras)?;
 
     if num_keys == 0 {
         return fetch_scan(datasource, scan, Some(lit(false)));
@@ -535,13 +557,13 @@ fn run_injected_scan(
     // injected_sql skips this: its filter is already baked into the SQL.)
     if num_keys < IN_CAP && scan.injected_sql.is_none() {
         let filter = in_list_filter(keys, inject_column)?;
-        return fetch_scan(datasource, scan, Some(filter));
+        return fetch_scan(datasource, scan, Some(and_option(filter, extra_filter)));
     }
     let kind = connectors::kind(datasource)?;
     // Parquet reads are in-process (DataFusion); the downstream join reduces
     // without any transfer, so shipping keys anywhere would be pointless.
     if kind == DsKind::Parquet {
-        return fetch_scan(datasource, scan, None);
+        return fetch_scan(datasource, scan, extra_filter);
     }
     // DuckDB: beyond the ingest ceiling, or a key type its temp-table ingest
     // cannot represent, the probe reads whole (correct, just unreduced).
@@ -549,7 +571,7 @@ fn run_injected_scan(
     if kind == DsKind::DuckDb
         && (num_keys > DUCK_TEMP_CAP || !connectors::duck_can_ingest(&keys.schema))
     {
-        return fetch_scan(datasource, scan, None);
+        return fetch_scan(datasource, scan, extra_filter);
     }
     // Postgres evaluates a key semi-join with an index scan ONLY when the probe
     // column is indexed; without an index it degrades to a full sequential scan
@@ -571,7 +593,32 @@ fn run_injected_scan(
     {
         return unselective_probe_scan(kind, datasource, scan);
     }
+    // The temp-table and parallel paths render their own SQL; extras do not
+    // thread through them yet - the primary reduction still applies, and the
+    // downstream join keeps exactness.
     temp_table_probe(datasource, scan, keys, inject_column)
+}
+
+/// AND of every extra key set as an IN list, skipping over-cap sets.
+fn extras_in_filter(extras: &[(&str, &Batches)]) -> PyResult<Option<Expr>> {
+    let mut combined: Option<Expr> = None;
+    for (column, keys) in extras {
+        let count: usize = keys.batches.iter().map(|b| b.num_rows()).sum();
+        if count == 0 || count >= IN_CAP {
+            continue;
+        }
+        let filter = in_list_filter(keys, column)?;
+        combined = Some(and_option(filter, combined));
+    }
+    Ok(combined)
+}
+
+/// `left AND right?` - the left filter, tightened by an optional second.
+fn and_option(left: Expr, right: Option<Expr>) -> Expr {
+    match right {
+        Some(other) => left.and(other),
+        None => left,
+    }
 }
 
 /// The probe read when the dynamic filter would select most of the table:

@@ -73,6 +73,13 @@ pub enum Step {
         /// near-superset key sets.
         #[serde(default)]
         inject_column_ndv: Option<u64>,
+        /// Further reductions ANDed onto the same read as bounded IN lists
+        /// (one scan can carry SEVERAL dimensions' keys - store AND date).
+        /// The PRIMARY injection above keeps the full delivery-strategy
+        /// machinery; an extra whose key set exceeds the IN cap is simply
+        /// skipped - extras are a bonus, never a requirement.
+        #[serde(default)]
+        extra_injections: Vec<ExtraInjection>,
     },
 
     /// Run a relational fragment over named inputs and bind its result. `inputs`
@@ -89,6 +96,13 @@ pub enum Step {
 
 /// A source scan. Either a structured single-table scan that Rust renders to
 /// dialect SQL, or a pre-rendered `raw_sql` string (used for a complex
+/// One additional key set ANDed onto an injected scan as a bounded IN list.
+#[derive(Debug, Deserialize)]
+pub struct ExtraInjection {
+    pub column: String,
+    pub keys_from: String,
+}
+
 /// single-source subtree whose SQL Python already emitted). A scan that a
 /// dynamic filter is injected into must be structured, so Rust can add the
 /// `IN (...)` predicate.
