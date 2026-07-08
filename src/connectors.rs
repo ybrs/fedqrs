@@ -75,10 +75,16 @@ thread_local! {
     // the shipped relation. Cleared (dropping the temp tables with it) at
     // query end by `clear_shipments`.
     static PINNED_DUCK: RefCell<HashMap<String, duckdb::Connection>> = RefCell::new(HashMap::new());
+    // (datasource name, table) pairs shipped as Postgres session TEMP TABLEs on
+    // the pooled PG_CACHE connection this query. Unlike DuckDB (where dropping
+    // the pinned connection drops its temp tables), the PG connection is reused
+    // across queries, so each shipped table is DROPped by name at query end.
+    static SHIPPED_PG: RefCell<Vec<(String, String)>> = RefCell::new(Vec::new());
 }
 
-/// Materialize a relation as a TEMP TABLE on the target DuckDB source, on a
-/// connection pinned for the rest of the query.
+/// Materialize a relation as a TEMP TABLE on the target source (DuckDB or
+/// Postgres), visible to that source's later reads this query. The optimizer
+/// chooses the target by cost; the engine supports both writable sources.
 pub fn ship_table(
     name: &str,
     table: &str,
@@ -86,11 +92,23 @@ pub fn ship_table(
     batches: Vec<RecordBatch>,
 ) -> PyResult<()> {
     let s = spec(name)?;
-    if s.kind != DsKind::DuckDb {
-        return Err(PyRuntimeError::new_err(format!(
-            "ship target '{name}' is not DuckDB (dim shipping supports DuckDB only)"
-        )));
+    match s.kind {
+        DsKind::DuckDb => ship_table_duckdb(&s, table, schema, batches),
+        DsKind::Postgres => ship_table_postgres(name, &s, table, schema, batches),
+        DsKind::Parquet => Err(PyRuntimeError::new_err(format!(
+            "ship target '{name}' is a read-only Parquet source; cannot ship into it"
+        ))),
     }
+}
+
+/// Ship into DuckDB: a TEMP TABLE on a connection pinned for the rest of the
+/// query (temp objects are per-connection, so every later read must share it).
+fn ship_table_duckdb(
+    s: &DsSpec,
+    table: &str,
+    schema: SchemaRef,
+    batches: Vec<RecordBatch>,
+) -> PyResult<()> {
     PINNED_DUCK.with(|cache| {
         let mut map = cache.borrow_mut();
         if !map.contains_key(&s.uri) {
@@ -101,9 +119,51 @@ pub fn ship_table(
     })
 }
 
-/// Drop every pinned connection (and with it every shipped temp table).
+/// Ship into Postgres: a session TEMP TABLE (ADBC binary-COPY ingest) on the
+/// pooled PG_CACHE connection, which every later fetch_postgres for this source
+/// reuses, so the shipped table is visible to the island read. Recorded for an
+/// explicit DROP at query end (the pooled connection outlives the query).
+fn ship_table_postgres(
+    name: &str,
+    s: &DsSpec,
+    table: &str,
+    schema: SchemaRef,
+    batches: Vec<RecordBatch>,
+) -> PyResult<()> {
+    let drop_sql = format!("DROP TABLE IF EXISTS \"{}\"", table.replace('"', "\"\""));
+    PG_CACHE.with(|cache| {
+        let mut map = cache.borrow_mut();
+        if !map.contains_key(name) {
+            map.insert(name.to_string(), open_pg(s).map_err(PyRuntimeError::new_err)?);
+        }
+        let pg = map.get_mut(name).unwrap();
+        exec_update(&mut pg.conn, &drop_sql).map_err(PyRuntimeError::new_err)?;
+        ingest_temp(&mut pg.conn, table, schema, batches).map_err(PyRuntimeError::new_err)
+    })?;
+    SHIPPED_PG.with(|s| s.borrow_mut().push((name.to_string(), table.to_string())));
+    Ok(())
+}
+
+/// Drop every shipped temp table: the pinned DuckDB connections (and their temp
+/// tables with them), and each Postgres shipped table by name on its pooled
+/// connection. Runs on every query exit path.
 pub fn clear_shipments() {
     PINNED_DUCK.with(|cache| cache.borrow_mut().clear());
+    drop_shipped_pg();
+}
+
+/// DROP each Postgres shipped table on its pooled connection, then forget them.
+fn drop_shipped_pg() {
+    let shipped: Vec<(String, String)> = SHIPPED_PG.with(|s| s.borrow_mut().drain(..).collect());
+    PG_CACHE.with(|cache| {
+        let mut map = cache.borrow_mut();
+        for (name, table) in shipped {
+            if let Some(pg) = map.get_mut(&name) {
+                let drop_sql = format!("DROP TABLE IF EXISTS \"{}\"", table.replace('"', "\"\""));
+                let _ = exec_update(&mut pg.conn, &drop_sql);
+            }
+        }
+    });
 }
 
 fn create_shipped_table(
