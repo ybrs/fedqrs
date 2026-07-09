@@ -357,7 +357,7 @@ impl Drop for ShipmentGuard {
 /// Python state, so the caller can run it with the GIL RELEASED - holding the
 /// GIL here would freeze every Python thread (e.g. a watchdog) for the whole
 /// query. The pyo3 wrapper in lib.rs turns the batches into an Arrow stream.
-pub fn execute(ir: &Ir) -> PyResult<(SchemaRef, Vec<RecordBatch>)> {
+pub fn execute(ir: &Ir) -> PyResult<(SchemaRef, Vec<RecordBatch>, Vec<(String, usize)>)> {
     // Shipped temp tables are strictly per-query; drop any pinned
     // connections a previous query left (also cleared on every exit path
     // by the guard below - this is the defensive backstop).
@@ -367,6 +367,10 @@ pub fn execute(ir: &Ir) -> PyResult<(SchemaRef, Vec<RecordBatch>)> {
         .map_err(|e| PyRuntimeError::new_err(format!("tokio runtime: {e}")))?;
     let mut bindings: HashMap<String, Binding> = HashMap::new();
     let mut remaining = binding_use_counts(ir);
+    // (binding, measured rows) for every materialized step, returned to Python
+    // as the learned-stats WRITE stream: the engine reports one number per step
+    // and python decides what it means. See adaptive-catalog-plan.md.
+    let mut observations: Vec<(String, usize)> = Vec::new();
 
     for step in &ir.steps {
         let started = std::time::Instant::now();
@@ -442,8 +446,12 @@ pub fn execute(ir: &Ir) -> PyResult<(SchemaRef, Vec<RecordBatch>)> {
                 runtime
                     .block_on(force_materialized(&mut bindings, input))
                     .map_err(df_to_py)?;
-                return export(&mut bindings, input);
+                let (schema, batches) = export(&mut bindings, input)?;
+                return Ok((schema, batches, observations));
             }
+        }
+        if let Some(name) = observable_binding(step) {
+            observations.push((name.clone(), binding_rows(&bindings, name)));
         }
         if profile_enabled() {
             log_step(step, ir, &bindings, started.elapsed().as_secs_f64() * 1000.0);
@@ -451,6 +459,19 @@ pub fn execute(ir: &Ir) -> PyResult<(SchemaRef, Vec<RecordBatch>)> {
     }
 
     Err(PyRuntimeError::new_err("IR had no `return` step"))
+}
+
+/// The output binding of a step whose result is MATERIALIZED and row-counted
+/// (a source read, a reduced scan, a distinct-key collection), or None for a
+/// lazy merge fragment (fusion streams its rows past the boundary uncounted -
+/// those become observations in v1.5 via DataFusion's output-row metrics).
+fn observable_binding(step: &Step) -> Option<&String> {
+    match step {
+        Step::SourceScan { binding, .. } => Some(binding),
+        Step::InjectedScan { binding, .. } => Some(binding),
+        Step::CollectDistinct { binding, .. } => Some(binding),
+        _ => None,
+    }
 }
 
 /// How many times each binding is read across the whole plan (merge inputs,
