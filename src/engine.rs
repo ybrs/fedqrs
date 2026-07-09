@@ -360,7 +360,7 @@ impl Drop for ShipmentGuard {
 /// GIL here would freeze every Python thread (e.g. a watchdog) for the whole
 /// query. The pyo3 wrapper in lib.rs turns the batches into an Arrow stream.
 pub fn execute(
-    ir: &Ir, observe: bool,
+    ir: &Ir,
 ) -> PyResult<(SchemaRef, Vec<RecordBatch>, Vec<(String, usize)>)> {
     // Shipped temp tables are strictly per-query; drop any pinned
     // connections a previous query left (also cleared on every exit path
@@ -377,7 +377,6 @@ pub fn execute(
     let mut observations: Vec<(String, usize)> = Vec::new();
     // Fresh group-count harvest for this query (aggregates run lazily; their
     // counts are read from AggregateExec metrics after each region collects).
-    OBSERVE.with(|o| o.set(observe));
     AGG_HARVEST.with(|h| h.borrow_mut().clear());
 
     for step in &ir.steps {
@@ -1142,16 +1141,12 @@ async fn collect_batches(
 async fn collect_tracked(
     df: datafusion::dataframe::DataFrame,
 ) -> Result<Vec<RecordBatch>, DataFusionError> {
-    if !OBSERVE.with(|o| o.get()) {
-        // Fast path (learning OFF, the default): stream exactly as before, with
-        // no plan kept and no metric walk - collect_tracked is the central
-        // collection path, so this must stay zero-overhead when not observing.
-        return collect_stream(df.execute_stream().await?).await;
-    }
-    // Observe path (learning ON): build the plan explicitly so the SAME plan is
-    // available AFTER the run for metric harvesting - a fused region's interior
-    // AggregateExec carries the group count the catalog wants, invisible from
-    // the streamed batches alone.
+    // Build the plan explicitly (identical to what df.execute_stream does
+    // internally) so the SAME plan is available AFTER the run for metric
+    // harvesting - a fused region's interior AggregateExec carries the group
+    // count the catalog wants, invisible from the streamed batches alone.
+    // Measured free vs df.execute_stream (the walk touches only AggregateExec
+    // metrics), so it runs unconditionally - no feature flag on the hot path.
     let plan = df.create_physical_plan().await?;
     let task_ctx = std::sync::Arc::new(df.task_ctx());
     let stream = datafusion::physical_plan::execute_stream(plan.clone(), task_ctx)?;
@@ -1176,10 +1171,6 @@ async fn collect_stream(
 }
 
 thread_local! {
-    // Whether this query harvests aggregate metrics (learning ON). Gates the
-    // collect_tracked plan-keeping path so the default (non-learning) run pays
-    // nothing extra on the central collection path.
-    static OBSERVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     // (sorted group-column names, measured group count) harvested from every
     // final AggregateExec that ran during this query. execute() matches these
     // to the observed aggregate fragments (by group columns) after the step

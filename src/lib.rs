@@ -58,17 +58,17 @@ fn fetch_parallel_to_stream(
 /// (binding, measured rows) pair per materialized step, which Python maps to
 /// catalog entries. Everything runs in Rust; only these cross back.
 #[pyfunction]
-#[pyo3(signature = (ir_json, observe=false))]
 fn execute_ir(
-    py: Python<'_>, ir_json: &str, observe: bool,
+    py: Python<'_>, ir_json: &str,
 ) -> PyResult<(ArrowStreamExport, Vec<(String, usize)>)> {
     let ir: ir::Ir = serde_json::from_str(ir_json)
         .map_err(|e| PyValueError::new_err(format!("invalid IR JSON: {e}")))?;
     // The engine touches no Python state, so release the GIL for the run.
     // Holding it would freeze every Python thread in the caller (a memory
-    // watchdog, a UI) for the query's whole duration. `observe` gates the
-    // aggregate metric harvest (learning ON); default off = the fast path.
-    let (schema, batches, observations) = py.allow_threads(|| engine::execute(&ir, observe))?;
+    // watchdog, a UI) for the query's whole duration. Per-step observations
+    // (incl. harvested group counts) always come back; python persists them
+    // only when a catalog is present.
+    let (schema, batches, observations) = py.allow_threads(|| engine::execute(&ir))?;
     Ok((stream_from_batches(schema, batches), observations))
 }
 
