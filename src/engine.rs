@@ -33,7 +33,9 @@ use tokio::runtime::Runtime;
 use crate::connectors;
 use fedqrs_core::types::DsKind;
 use fedqrs_core::expr::{literal_from_array, to_df_expr};
-use fedqrs_core::ir::{AggCall, AggSelectItem, Fragment, Ir, JoinKind, Projection, ScanSpec, Step};
+use fedqrs_core::ir::{
+    AggCall, AggSelectItem, Fragment, Ir, IrExpr, JoinKind, Projection, ScanSpec, Step,
+};
 use fedqrs_core::sql::{base_filter_sql, render_expr, scan_sql, select_list_sql, temp_join_sql};
 
 /// Dynamic-filter strategy thresholds. Under `IN_CAP` distinct keys we inline an
@@ -357,7 +359,9 @@ impl Drop for ShipmentGuard {
 /// Python state, so the caller can run it with the GIL RELEASED - holding the
 /// GIL here would freeze every Python thread (e.g. a watchdog) for the whole
 /// query. The pyo3 wrapper in lib.rs turns the batches into an Arrow stream.
-pub fn execute(ir: &Ir) -> PyResult<(SchemaRef, Vec<RecordBatch>, Vec<(String, usize)>)> {
+pub fn execute(
+    ir: &Ir, observe: bool,
+) -> PyResult<(SchemaRef, Vec<RecordBatch>, Vec<(String, usize)>)> {
     // Shipped temp tables are strictly per-query; drop any pinned
     // connections a previous query left (also cleared on every exit path
     // by the guard below - this is the defensive backstop).
@@ -371,6 +375,10 @@ pub fn execute(ir: &Ir) -> PyResult<(SchemaRef, Vec<RecordBatch>, Vec<(String, u
     // as the learned-stats WRITE stream: the engine reports one number per step
     // and python decides what it means. See adaptive-catalog-plan.md.
     let mut observations: Vec<(String, usize)> = Vec::new();
+    // Fresh group-count harvest for this query (aggregates run lazily; their
+    // counts are read from AggregateExec metrics after each region collects).
+    OBSERVE.with(|o| o.set(observe));
+    AGG_HARVEST.with(|h| h.borrow_mut().clear());
 
     for step in &ir.steps {
         let started = std::time::Instant::now();
@@ -447,6 +455,7 @@ pub fn execute(ir: &Ir) -> PyResult<(SchemaRef, Vec<RecordBatch>, Vec<(String, u
                     .block_on(force_materialized(&mut bindings, input))
                     .map_err(df_to_py)?;
                 let (schema, batches) = export(&mut bindings, input)?;
+                append_group_observations(ir, &mut observations);
                 return Ok((schema, batches, observations));
             }
         }
@@ -1133,9 +1142,30 @@ async fn collect_batches(
 async fn collect_tracked(
     df: datafusion::dataframe::DataFrame,
 ) -> Result<Vec<RecordBatch>, DataFusionError> {
+    if !OBSERVE.with(|o| o.get()) {
+        // Fast path (learning OFF, the default): stream exactly as before, with
+        // no plan kept and no metric walk - collect_tracked is the central
+        // collection path, so this must stay zero-overhead when not observing.
+        return collect_stream(df.execute_stream().await?).await;
+    }
+    // Observe path (learning ON): build the plan explicitly so the SAME plan is
+    // available AFTER the run for metric harvesting - a fused region's interior
+    // AggregateExec carries the group count the catalog wants, invisible from
+    // the streamed batches alone.
+    let plan = df.create_physical_plan().await?;
+    let task_ctx = std::sync::Arc::new(df.task_ctx());
+    let stream = datafusion::physical_plan::execute_stream(plan.clone(), task_ctx)?;
+    let batches = collect_stream(stream).await?;
+    harvest_aggregates(&plan);
+    Ok(batches)
+}
+
+/// Drain a stream into a Vec, charging each batch to the shared memory pool.
+async fn collect_stream(
+    mut stream: datafusion::physical_plan::SendableRecordBatchStream,
+) -> Result<Vec<RecordBatch>, DataFusionError> {
     let reservation =
         MemoryConsumer::new("fedq_collect").register(&runtime_env().memory_pool);
-    let mut stream = df.execute_stream().await?;
     let mut batches = Vec::new();
     while let Some(item) = stream.next().await {
         let batch = item?;
@@ -1143,6 +1173,104 @@ async fn collect_tracked(
         batches.push(batch);
     }
     Ok(batches)
+}
+
+thread_local! {
+    // Whether this query harvests aggregate metrics (learning ON). Gates the
+    // collect_tracked plan-keeping path so the default (non-learning) run pays
+    // nothing extra on the central collection path.
+    static OBSERVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    // (sorted group-column names, measured group count) harvested from every
+    // final AggregateExec that ran during this query. execute() matches these
+    // to the observed aggregate fragments (by group columns) after the step
+    // loop, turning a lazy-fused cross-source GROUP BY's collapse - invisible
+    // from the streamed batches - into a learned-stats observation.
+    static AGG_HARVEST: std::cell::RefCell<Vec<(String, usize)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Walk a collected physical plan and record each FINAL aggregate's group
+/// columns and output-row count (the group count) into the harvest buffer.
+/// Partial aggregates are skipped - their per-partition counts are not the
+/// group count.
+fn harvest_aggregates(plan: &Arc<dyn datafusion::physical_plan::ExecutionPlan>) {
+    use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
+    use datafusion::physical_plan::ExecutionPlan;
+    let any = plan.as_ref() as &dyn std::any::Any;
+    if let Some(agg) = any.downcast_ref::<AggregateExec>() {
+        if !matches!(agg.mode(), AggregateMode::Partial) {
+            if let Some(rows) = plan.metrics().and_then(|m| m.output_rows()) {
+                let key = agg_group_key(agg);
+                AGG_HARVEST.with(|h| h.borrow_mut().push((key, rows)));
+            }
+        }
+    }
+    for child in plan.children() {
+        harvest_aggregates(child);
+    }
+}
+
+/// The sorted, comma-joined output names of an aggregate's GROUP BY columns -
+/// the key that matches a harvested count to its observed aggregate fragment.
+fn agg_group_key(agg: &datafusion::physical_plan::aggregates::AggregateExec) -> String {
+    let mut names: Vec<String> =
+        agg.group_expr().expr().iter().map(|(_, name)| name.clone()).collect();
+    names.sort();
+    names.join(",")
+}
+
+/// Append a (binding, group count) observation for every aggregate merge
+/// fragment whose group columns match EXACTLY ONE harvested aggregate. Runs
+/// after the whole plan executed, so every region has collected and harvested.
+fn append_group_observations(ir: &Ir, observations: &mut Vec<(String, usize)>) {
+    let harvest: Vec<(String, usize)> = AGG_HARVEST.with(|h| h.borrow().clone());
+    for step in &ir.steps {
+        if let Step::Merge { fragment, binding, .. } = step {
+            if let Some(Fragment::Aggregate { group_by, grouping_sets, .. }) =
+                ir.fragments.get(fragment)
+            {
+                if grouping_sets.is_empty() {
+                    if let Some(rows) = match_group_count(&harvest, group_by) {
+                        observations.push((binding.clone(), rows));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The group count for a group-by list when EXACTLY ONE harvested aggregate has
+/// the same (sorted, plain-column) key, else None - the catalog would rather
+/// miss a value than key an ambiguous one to the wrong subplan.
+fn match_group_count(harvest: &[(String, usize)], group_by: &[IrExpr]) -> Option<usize> {
+    let key = group_by_key(group_by)?;
+    let mut found: Option<usize> = None;
+    for (harvested_key, rows) in harvest {
+        if *harvested_key == key {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(*rows);
+        }
+    }
+    found
+}
+
+/// The sorted comma-joined names of a group-by list when every key is a plain
+/// column, else None (an expression key has no name to match a harvest on).
+fn group_by_key(group_by: &[IrExpr]) -> Option<String> {
+    if group_by.is_empty() {
+        return None;
+    }
+    let mut names = Vec::with_capacity(group_by.len());
+    for expr in group_by {
+        match expr {
+            IrExpr::Column { name, .. } => names.push(name.clone()),
+            _ => return None,
+        }
+    }
+    names.sort();
+    Some(names.join(","))
 }
 
 /// A copy of `schema` with every field marked nullable, keeping each field's
