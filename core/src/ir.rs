@@ -107,7 +107,9 @@ pub enum Step {
 /// A source scan. Either a structured single-table scan that Rust renders to
 /// dialect SQL, or a pre-rendered `raw_sql` string (used for a complex
 /// One additional key set ANDed onto an injected scan as a bounded IN list.
-#[derive(Debug, Deserialize)]
+/// Clone: a prefetched injected scan ships an owned copy of its spec to a
+/// worker thread (the job cannot borrow the IR across the pool boundary).
+#[derive(Debug, Clone, Deserialize)]
 pub struct ExtraInjection {
     pub column: String,
     pub keys_from: String,
@@ -116,7 +118,9 @@ pub struct ExtraInjection {
 /// single-source subtree whose SQL Python already emitted). A scan that a
 /// dynamic filter is injected into must be structured, so Rust can add the
 /// `IN (...)` predicate.
-#[derive(Debug, Deserialize)]
+/// Clone: a prefetched injected scan ships an owned copy of its spec to a
+/// worker thread (the job cannot borrow the IR across the pool boundary).
+#[derive(Debug, Clone, Deserialize)]
 pub struct ScanSpec {
     /// Pre-rendered SQL for the whole scan. When set, the structured fields are
     /// ignored and no dynamic filter may be injected.

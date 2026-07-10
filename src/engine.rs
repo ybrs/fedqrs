@@ -87,7 +87,10 @@ fn memory_capped_context() -> SessionContext {
     SessionContext::new_with_config_rt(SessionConfig::new(), runtime_env())
 }
 
-/// Fully-read Arrow data with its schema.
+/// Fully-read Arrow data with its schema. Clone is Arc-shallow (RecordBatch
+/// columns are refcounted) - a prefetch job clones the keys it hands to a
+/// worker so the driving thread's binding lifecycle stays untouched.
+#[derive(Clone)]
 struct Batches {
     schema: SchemaRef,
     batches: Vec<RecordBatch>,
@@ -390,7 +393,7 @@ pub fn execute(
         let mut profile_ms: Option<f64> = None;
         match step {
             Step::SourceScan { datasource, scan, binding, materialize: _ } => {
-                let batches = match prefetched.remove(&index) {
+                let batches = match prefetched.take(index) {
                     Some(rx) => {
                         let (batches, fetch_ms) = recv_prefetch(rx)?;
                         profile_ms = Some(fetch_ms);
@@ -410,23 +413,37 @@ pub fn execute(
                     .map_err(df_to_py)?;
                 note_use(&mut remaining, input);
                 bindings.insert(binding.clone(), Binding::Keys(keys));
+                // Keys just landed: every later injection whose key sets are
+                // now all bound starts fetching on the workers immediately,
+                // overlapping whatever the loop does next.
+                dispatch_ready_injections(ir, index, &bindings, &mut prefetched);
             }
 
             Step::InjectedScan {
                 datasource, scan, inject_column, keys_from, binding, inject_column_ndv,
                 extra_injections,
             } => {
-                let keys = keys_binding(&bindings, keys_from)?;
-                let mut extras: Vec<(&str, &Batches)> = Vec::new();
-                for extra in extra_injections {
-                    extras.push((
-                        extra.column.as_str(),
-                        keys_binding(&bindings, &extra.keys_from)?,
-                    ));
-                }
-                let batches = run_injected_scan(
-                    datasource, scan, inject_column, keys, *inject_column_ndv, &extras,
-                )?;
+                let batches = match prefetched.take(index) {
+                    Some(rx) => {
+                        let (batches, fetch_ms) = recv_prefetch(rx)?;
+                        profile_ms = Some(fetch_ms);
+                        batches
+                    }
+                    None => {
+                        let keys = keys_binding(&bindings, keys_from)?;
+                        let mut extras: Vec<(&str, &Batches)> = Vec::new();
+                        for extra in extra_injections {
+                            extras.push((
+                                extra.column.as_str(),
+                                keys_binding(&bindings, &extra.keys_from)?,
+                            ));
+                        }
+                        run_injected_scan(
+                            datasource, scan, inject_column, keys, *inject_column_ndv,
+                            &extras,
+                        )?
+                    }
+                };
                 note_use(&mut remaining, keys_from);
                 for extra in extra_injections {
                     note_use(&mut remaining, &extra.keys_from);
@@ -589,12 +606,29 @@ const STEP_WORKERS: usize = 6;
 /// wait); errors cross the thread boundary as text.
 type PrefetchReply = Result<(Batches, f64), String>;
 
-/// One whole-scan prefetch job. The SQL is rendered on the driving thread
-/// (rendering is pure); only strings cross to the worker, so the job carries
-/// no borrow of the IR and the pool can outlive every query.
+/// The remote read a prefetch worker runs. Everything is OWNED (specs cloned,
+/// keys Arc-shallow-cloned) so the job carries no borrow of the IR and the
+/// pool can outlive every query.
+enum PrefetchWork {
+    /// A plain scan, rendered to SQL on the driving thread (rendering is pure).
+    PlainScan { datasource: String, sql: String },
+    /// A key-reduced scan. The worker runs the FULL delivery-strategy machinery
+    /// (inline IN / temp table / unselective fallback); every path is worker-
+    /// safe: temp tables are per-CONNECTION (each worker owns its own), the
+    /// ctid fallback fans to a DIFFERENT pool (one-way, no cycle).
+    InjectedScan {
+        datasource: String,
+        scan: ScanSpec,
+        inject_column: String,
+        keys: Batches,
+        inject_column_ndv: Option<u64>,
+        extras: Vec<(String, Batches)>,
+    },
+}
+
+/// One prefetch job: the work plus its reply channel.
 struct PrefetchJob {
-    datasource: String,
-    sql: String,
+    work: PrefetchWork,
     reply: std::sync::mpsc::Sender<PrefetchReply>,
 }
 
@@ -614,19 +648,37 @@ fn step_pool() -> &'static Vec<std::sync::mpsc::Sender<PrefetchJob>> {
     })
 }
 
-/// One prefetch worker: serve whole-scan fetches until process exit. A send
+/// One prefetch worker: serve remote reads until process exit. A send
 /// failure means the query abandoned its receiver (an error unwound the step
 /// loop) - the fetch is discarded and the worker moves on.
 fn prefetch_worker_loop(rx: std::sync::mpsc::Receiver<PrefetchJob>) {
     while let Ok(job) = rx.recv() {
         let started = std::time::Instant::now();
-        let result = connectors::fetch(&job.datasource, &job.sql)
-            .map(|(schema, batches)| {
-                let elapsed = started.elapsed().as_secs_f64() * 1000.0;
-                (Batches { schema, batches }, elapsed)
-            })
+        let result = run_prefetch_work(&job.work)
+            .map(|batches| (batches, started.elapsed().as_secs_f64() * 1000.0))
             .map_err(stringify_pyerr);
         let _ = job.reply.send(result);
+    }
+}
+
+/// Execute one prefetch work item on the worker's own connections.
+fn run_prefetch_work(work: &PrefetchWork) -> PyResult<Batches> {
+    match work {
+        PrefetchWork::PlainScan { datasource, sql } => {
+            let (schema, batches) = connectors::fetch(datasource, sql)?;
+            Ok(Batches { schema, batches })
+        }
+        PrefetchWork::InjectedScan {
+            datasource, scan, inject_column, keys, inject_column_ndv, extras,
+        } => {
+            let mut extra_refs: Vec<(&str, &Batches)> = Vec::new();
+            for (column, batches) in extras {
+                extra_refs.push((column.as_str(), batches));
+            }
+            run_injected_scan(
+                datasource, scan, inject_column, keys, *inject_column_ndv, &extra_refs,
+            )
+        }
     }
 }
 
@@ -676,30 +728,126 @@ fn prefetch_sql(step: &Step, ship_targets: &HashSet<String>) -> Option<(String, 
     Some((datasource.clone(), sql))
 }
 
-/// Dispatch every prefetchable scan to the step pool (round-robin), keyed by
-/// step index. Runs once before the step loop; the loop consumes each
-/// receiver when it reaches that step, so results land in `bindings` in step
-/// order regardless of completion order - nothing downstream can observe the
-/// concurrency.
-fn dispatch_prefetches(ir: &Ir) -> HashMap<usize, std::sync::mpsc::Receiver<PrefetchReply>> {
-    let mut receivers = HashMap::new();
-    if !parallel_steps_enabled() {
-        return receivers;
+/// Round-robin prefetch dispatch state: the per-step receivers the loop
+/// consumes, plus the rotating pool cursor.
+struct Prefetches {
+    receivers: HashMap<usize, std::sync::mpsc::Receiver<PrefetchReply>>,
+    next_worker: usize,
+    ship_targets: HashSet<String>,
+    enabled: bool,
+}
+
+impl Prefetches {
+    /// Send one work item to the pool, keyed by its step index. A send
+    /// failure (a worker died to a panic) simply leaves the step to the
+    /// sequential arm.
+    fn dispatch(&mut self, index: usize, work: PrefetchWork) {
+        let pool = step_pool();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let job = PrefetchJob { work, reply: tx };
+        if pool[self.next_worker % pool.len()].send(job).is_ok() {
+            self.receivers.insert(index, rx);
+        }
+        self.next_worker += 1;
     }
-    let ship_targets = ship_target_datasources(ir);
-    let pool = step_pool();
-    let mut next = 0usize;
+
+    /// Take the receiver for a step the loop has reached, if it was dispatched.
+    fn take(&mut self, index: usize) -> Option<std::sync::mpsc::Receiver<PrefetchReply>> {
+        self.receivers.remove(&index)
+    }
+}
+
+/// Dispatch every DEPENDENCY-FREE prefetchable scan (plain source scans)
+/// before the loop starts. The loop consumes each receiver when it reaches
+/// that step, so results land in `bindings` in step order regardless of
+/// completion order - nothing downstream can observe the concurrency.
+fn dispatch_prefetches(ir: &Ir) -> Prefetches {
+    let mut prefetches = Prefetches {
+        receivers: HashMap::new(),
+        next_worker: 0,
+        ship_targets: ship_target_datasources(ir),
+        enabled: parallel_steps_enabled(),
+    };
+    if !prefetches.enabled {
+        return prefetches;
+    }
     for (index, step) in ir.steps.iter().enumerate() {
-        if let Some((datasource, sql)) = prefetch_sql(step, &ship_targets) {
-            let (tx, rx) = std::sync::mpsc::channel();
-            let job = PrefetchJob { datasource, sql, reply: tx };
-            if pool[next % pool.len()].send(job).is_ok() {
-                receivers.insert(index, rx);
-            }
-            next += 1;
+        if let Some((datasource, sql)) = prefetch_sql(step, &prefetches.ship_targets) {
+            prefetches.dispatch(index, PrefetchWork::PlainScan { datasource, sql });
         }
     }
-    receivers
+    prefetches
+}
+
+/// Dispatch every LATER InjectedScan whose keys (primary + every extra) are
+/// all bound - called after each CollectDistinct lands, the only step that
+/// produces keys. The keys are Arc-shallow CLONED into the job, so the
+/// driving thread's binding lifecycle (use counts, takes) stays untouched.
+fn dispatch_ready_injections(
+    ir: &Ir,
+    after: usize,
+    bindings: &HashMap<String, Binding>,
+    prefetches: &mut Prefetches,
+) {
+    if !prefetches.enabled {
+        return;
+    }
+    for (index, step) in ir.steps.iter().enumerate().skip(after + 1) {
+        if prefetches.receivers.contains_key(&index) {
+            continue;
+        }
+        if let Some(work) = injection_work(step, bindings, &prefetches.ship_targets) {
+            prefetches.dispatch(index, work);
+        }
+    }
+}
+
+/// The owned work item for an InjectedScan whose every key binding is ready,
+/// or None (not an injection, a ship-target datasource, or keys still
+/// pending - a later CollectDistinct will retry it).
+fn injection_work(
+    step: &Step,
+    bindings: &HashMap<String, Binding>,
+    ship_targets: &HashSet<String>,
+) -> Option<PrefetchWork> {
+    let Step::InjectedScan {
+        datasource, scan, inject_column, keys_from, inject_column_ndv, extra_injections, ..
+    } = step else {
+        return None;
+    };
+    if ship_targets.contains(datasource) {
+        return None;
+    }
+    // Only NETWORK-bound injections overlap profitably. A DuckDB injected
+    // scan is in-process and already saturates every core (measured at SF10:
+    // concurrent duck semi-joins gained nothing and paid contention - q46
+    // +82ms, q78 +60ms - while pg injections overlapped cleanly).
+    if connectors::kind(datasource).ok()? != DsKind::Postgres {
+        return None;
+    }
+    let keys = ready_keys(bindings, keys_from)?;
+    let mut extras = Vec::new();
+    for extra in extra_injections {
+        extras.push((extra.column.clone(), ready_keys(bindings, &extra.keys_from)?));
+    }
+    Some(PrefetchWork::InjectedScan {
+        datasource: datasource.clone(),
+        scan: scan.clone(),
+        inject_column: inject_column.clone(),
+        keys,
+        inject_column_ndv: *inject_column_ndv,
+        extras,
+    })
+}
+
+/// An Arc-shallow clone of a bound key set, or None while it is not (yet) a
+/// Keys binding - a WRONG-typed binding also returns None so the sequential
+/// arm raises the identical loud error at its step.
+fn ready_keys(bindings: &HashMap<String, Binding>, name: &str) -> Option<Batches> {
+    match bindings.get(name) {
+        Some(Binding::Keys(batches)) => Some(batches.clone()),
+        _ => None,
+    }
 }
 
 /// Take a prefetched scan's result, converting a worker-side failure back
