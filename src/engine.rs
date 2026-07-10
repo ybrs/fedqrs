@@ -7,7 +7,7 @@
 //! SQL here, so key values are never handed to Python. Only the final result
 //! crosses the boundary, once.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 
 use arrow::array::RecordBatch;
@@ -378,12 +378,26 @@ pub fn execute(
     // Fresh group-count harvest for this query (aggregates run lazily; their
     // counts are read from AggregateExec metrics after each region collects).
     AGG_HARVEST.with(|h| h.borrow_mut().clear());
+    // Independent plain scans start fetching NOW on the prefetch workers; the
+    // loop below consumes each result when it reaches that step, so remote
+    // reads overlap while bindings still land in step order.
+    let mut prefetched = dispatch_prefetches(ir);
 
-    for step in &ir.steps {
+    for (index, step) in ir.steps.iter().enumerate() {
         let started = std::time::Instant::now();
+        // A prefetched scan reports the WORKER's fetch time on its profile
+        // line (the driving thread's recv wait would under-report overlap).
+        let mut profile_ms: Option<f64> = None;
         match step {
             Step::SourceScan { datasource, scan, binding, materialize: _ } => {
-                let batches = fetch_source(datasource, scan)?;
+                let batches = match prefetched.remove(&index) {
+                    Some(rx) => {
+                        let (batches, fetch_ms) = recv_prefetch(rx)?;
+                        profile_ms = Some(fetch_ms);
+                        batches
+                    }
+                    None => fetch_source(datasource, scan)?,
+                };
                 store_relation(&mut bindings, binding, batches).map_err(df_to_py)?;
             }
 
@@ -462,7 +476,8 @@ pub fn execute(
             observations.push((name.clone(), binding_rows(&bindings, name)));
         }
         if profile_enabled() {
-            log_step(step, ir, &bindings, started.elapsed().as_secs_f64() * 1000.0);
+            let elapsed = profile_ms.unwrap_or(started.elapsed().as_secs_f64() * 1000.0);
+            log_step(step, ir, &bindings, elapsed);
         }
     }
 
@@ -557,6 +572,148 @@ fn fetch_scan(
     let sql = scan_sql(kind, scan, extra_filter).map_err(df_to_py)?;
     let (schema, batches) = connectors::fetch(datasource, &sql)?;
     Ok(Batches { schema, batches })
+}
+
+// ---------- cross-step parallel reads (plain source scans) --------------------
+
+/// Workers serving whole-step scan prefetches. Distinct from the ctid
+/// PARTITION pool (`connectors::fetch_parallel`, which splits ONE big scan):
+/// each of these runs one COMPLETE plain scan, through the same
+/// `connectors::fetch` the sequential path uses - which is thread-correct by
+/// construction (per-THREAD PostgreSQL connection caches, a mutex-guarded
+/// DuckDB base cloned per fetch, shared-safe Parquet contexts).
+const STEP_WORKERS: usize = 6;
+
+/// A prefetch's reply: the fetched batches plus the worker-measured fetch
+/// time (the profile line reports the fetch cost, not the driving thread's
+/// wait); errors cross the thread boundary as text.
+type PrefetchReply = Result<(Batches, f64), String>;
+
+/// One whole-scan prefetch job. The SQL is rendered on the driving thread
+/// (rendering is pure); only strings cross to the worker, so the job carries
+/// no borrow of the IR and the pool can outlive every query.
+struct PrefetchJob {
+    datasource: String,
+    sql: String,
+    reply: std::sync::mpsc::Sender<PrefetchReply>,
+}
+
+/// The fixed pool of long-lived prefetch workers. Persisting the threads
+/// pools their per-thread source connections across queries, so repeated
+/// prefetches pay no reconnect cost (the same rationale as the ctid pool).
+fn step_pool() -> &'static Vec<std::sync::mpsc::Sender<PrefetchJob>> {
+    static POOL: OnceLock<Vec<std::sync::mpsc::Sender<PrefetchJob>>> = OnceLock::new();
+    POOL.get_or_init(|| {
+        let mut senders = Vec::new();
+        for _ in 0..STEP_WORKERS {
+            let (tx, rx) = std::sync::mpsc::channel::<PrefetchJob>();
+            std::thread::spawn(move || prefetch_worker_loop(rx));
+            senders.push(tx);
+        }
+        senders
+    })
+}
+
+/// One prefetch worker: serve whole-scan fetches until process exit. A send
+/// failure means the query abandoned its receiver (an error unwound the step
+/// loop) - the fetch is discarded and the worker moves on.
+fn prefetch_worker_loop(rx: std::sync::mpsc::Receiver<PrefetchJob>) {
+    while let Ok(job) = rx.recv() {
+        let started = std::time::Instant::now();
+        let result = connectors::fetch(&job.datasource, &job.sql)
+            .map(|(schema, batches)| {
+                let elapsed = started.elapsed().as_secs_f64() * 1000.0;
+                (Batches { schema, batches }, elapsed)
+            })
+            .map_err(stringify_pyerr);
+        let _ = job.reply.send(result);
+    }
+}
+
+/// Render a worker-side PyErr to text attached to the interpreter (formatting
+/// a PyErr can touch Python state); the driving thread rebuilds a
+/// PyRuntimeError from the text.
+fn stringify_pyerr(e: PyErr) -> String {
+    Python::attach(|py| e.value(py).to_string())
+}
+
+/// Whether cross-step parallel reads are on. FEDQRS_PARALLEL_STEPS=0 is the
+/// kill switch restoring the fully sequential step loop.
+fn parallel_steps_enabled() -> bool {
+    std::env::var("FEDQRS_PARALLEL_STEPS").map(|v| v != "0").unwrap_or(true)
+}
+
+/// The datasources any Ship step targets. A scan on such a datasource may
+/// reference a shipped TEMP table that exists only on the driving thread's
+/// PINNED connection, so it must never run on a prefetch worker (whose own
+/// connection cannot see it). Conservative by datasource, not by table: the
+/// IR does not yet carry per-scan ship-visibility edges.
+fn ship_target_datasources(ir: &Ir) -> HashSet<String> {
+    let mut targets = HashSet::new();
+    for step in &ir.steps {
+        if let Step::Ship { datasource, .. } = step {
+            targets.insert(datasource.clone());
+        }
+    }
+    targets
+}
+
+/// The (datasource, rendered SQL) of a scan this pass may prefetch: a plain
+/// non-ctid-parallel SourceScan on a datasource no ship targets. A ctid-
+/// parallel scan stays on the driving thread - it already fans out to the
+/// partition pool, and running one pool inside another invites starvation
+/// deadlocks. A datasource/render error returns None so the sequential arm
+/// raises the IDENTICAL error in step order (deferred, never swallowed).
+fn prefetch_sql(step: &Step, ship_targets: &HashSet<String>) -> Option<(String, String)> {
+    let Step::SourceScan { datasource, scan, .. } = step else {
+        return None;
+    };
+    if scan.parallel || ship_targets.contains(datasource) {
+        return None;
+    }
+    let kind = connectors::kind(datasource).ok()?;
+    let sql = scan_sql(kind, scan, None).ok()?;
+    Some((datasource.clone(), sql))
+}
+
+/// Dispatch every prefetchable scan to the step pool (round-robin), keyed by
+/// step index. Runs once before the step loop; the loop consumes each
+/// receiver when it reaches that step, so results land in `bindings` in step
+/// order regardless of completion order - nothing downstream can observe the
+/// concurrency.
+fn dispatch_prefetches(ir: &Ir) -> HashMap<usize, std::sync::mpsc::Receiver<PrefetchReply>> {
+    let mut receivers = HashMap::new();
+    if !parallel_steps_enabled() {
+        return receivers;
+    }
+    let ship_targets = ship_target_datasources(ir);
+    let pool = step_pool();
+    let mut next = 0usize;
+    for (index, step) in ir.steps.iter().enumerate() {
+        if let Some((datasource, sql)) = prefetch_sql(step, &ship_targets) {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let job = PrefetchJob { datasource, sql, reply: tx };
+            if pool[next % pool.len()].send(job).is_ok() {
+                receivers.insert(index, rx);
+            }
+            next += 1;
+        }
+    }
+    receivers
+}
+
+/// Take a prefetched scan's result, converting a worker-side failure back
+/// into the loud error the sequential path would have raised.
+fn recv_prefetch(
+    rx: std::sync::mpsc::Receiver<PrefetchReply>,
+) -> PyResult<(Batches, f64)> {
+    match rx.recv() {
+        Ok(Ok(result)) => Ok(result),
+        Ok(Err(message)) => Err(PyRuntimeError::new_err(message)),
+        Err(_) => Err(PyRuntimeError::new_err(
+            "prefetch worker died before replying (worker thread panic)",
+        )),
+    }
 }
 
 /// Borrow a binding as materialized batches.
