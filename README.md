@@ -1,3 +1,6 @@
+This project is merged into https://github.com/ybrs/federated-query 
+So we archived it.
+
 # fedqrs — the federated-query execution engine (Rust)
 
 `fedqrs` executes a federated query plan natively in Rust on DataFusion, and is
